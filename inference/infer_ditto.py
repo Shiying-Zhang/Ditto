@@ -1,29 +1,97 @@
 import argparse
-import torch
+import json
 import os
+import sys
+from pathlib import Path
+
+import torch
+from PIL import Image
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from diffsynth import save_video, VideoData
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
+
+
+DEFAULT_NEGATIVE_PROMPT = "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
+
+
+def _existing_weight(path: Path) -> bool:
+    return path.exists() and path.is_file() and not path.name.endswith((".fdmdownload", ".crdownload"))
+
+
+def _local_model_configs(checkpoint_path: str) -> tuple[list, ModelConfig]:
+    model_dir = Path(checkpoint_path).expanduser().resolve()
+    transformer_paths = [str(path) for path in sorted(model_dir.glob("diffusion_pytorch_model*.safetensors"))]
+    text_encoder_path = model_dir / "models_t5_umt5-xxl-enc-bf16.pth"
+    vae_path = model_dir / "Wan2.1_VAE.pth"
+    tokenizer_dir = model_dir / "google" / "umt5-xxl"
+    if not transformer_paths or not _existing_weight(text_encoder_path) or not _existing_weight(vae_path) or not tokenizer_dir.exists():
+        raise RuntimeError(
+            f"Incomplete local checkpoint at {model_dir}. Expected diffusion shards, text encoder, VAE, and google/umt5-xxl tokenizer files."
+        )
+    model_configs = [
+        ModelConfig(path=transformer_paths, offload_device="cpu"),
+        ModelConfig(path=[str(text_encoder_path)], offload_device="cpu"),
+        ModelConfig(path=[str(vae_path)], offload_device="cpu"),
+    ]
+    tokenizer_config = ModelConfig(path=str(tokenizer_dir))
+    return model_configs, tokenizer_config
+
+
+def _parse_multi_values(raw_values, raw_alphas, default_alpha: float) -> tuple[list[str], list[float]]:
+    lora_paths: list[str] = []
+    lora_alphas: list[float] = []
+    for raw in raw_values or []:
+        for item in str(raw).split(","):
+            item = item.strip()
+            if item:
+                lora_paths.append(item)
+    if not lora_paths:
+        return [], []
+    if not raw_alphas:
+        return lora_paths, [default_alpha] * len(lora_paths)
+    if len(raw_alphas) == 1 and len(lora_paths) > 1:
+        return lora_paths, [float(raw_alphas[0])] * len(lora_paths)
+    parsed_alphas = [float(item) for item in raw_alphas]
+    if len(parsed_alphas) != len(lora_paths):
+        raise ValueError("The number of lora_alpha values must match the number of lora_path values, or provide a single shared alpha.")
+    return lora_paths, parsed_alphas
 
 
 def main(args):
 
     device = f"cuda:{args.device_id}"
 
-    pipe = WanVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16,
-        device=device,
-        model_configs=[
-            ModelConfig(model_id="Wan-AI/Wan2.1-VACE-14B", origin_file_pattern="diffusion_pytorch_model*.safetensors", offload_device="cpu"),
-            ModelConfig(model_id="Wan-AI/Wan2.1-VACE-14B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth", offload_device="cpu"),
-            ModelConfig(model_id="Wan-AI/Wan2.1-VACE-14B", origin_file_pattern="Wan2.1_VAE.pth", offload_device="cpu"),
-        ],
-    )
-    if args.lora_path:
-        print(f"Loading Ditto LoRA model: {args.lora_path} (alpha={args.lora_alpha})")
-        if not os.path.exists(args.lora_path):
-            print(f"Error: LoRA file not found at {args.lora_path}")
+    if args.checkpoint_path:
+        model_configs, tokenizer_config = _local_model_configs(args.checkpoint_path)
+        pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device=device,
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+            redirect_common_files=False,
+        )
+    else:
+        pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device=device,
+            model_configs=[
+                ModelConfig(model_id="Wan-AI/Wan2.1-VACE-14B", origin_file_pattern="diffusion_pytorch_model*.safetensors", offload_device="cpu"),
+                ModelConfig(model_id="Wan-AI/Wan2.1-VACE-14B", origin_file_pattern="models_t5_umt5-xxl-enc-bf16.pth", offload_device="cpu"),
+                ModelConfig(model_id="Wan-AI/Wan2.1-VACE-14B", origin_file_pattern="Wan2.1_VAE.pth", offload_device="cpu"),
+            ],
+        )
+
+    lora_paths, lora_alphas = _parse_multi_values(args.lora_path, args.lora_alpha, args.default_lora_alpha)
+    for lora_path, alpha in zip(lora_paths, lora_alphas):
+        print(f"Loading Ditto LoRA model: {lora_path} (alpha={alpha})")
+        if not os.path.exists(lora_path):
+            print(f"Error: LoRA file not found at {lora_path}")
             return
-        pipe.load_lora(pipe.vace, args.lora_path, alpha=args.lora_alpha)
+        pipe.load_lora(pipe.vace, lora_path, alpha=alpha)
 
     pipe.enable_vram_management()
 
@@ -32,7 +100,8 @@ def main(args):
         print(f"Error: Input video file not found at {args.input_video}")
         return
         
-    video = VideoData(args.input_video, height=args.height, width=args.width)
+    input_video_path = args.control_video or args.input_video
+    video = VideoData(input_video_path, height=args.height, width=args.width)
     
     num_frames = min(args.num_frames, len(video))
     if num_frames != args.num_frames:
@@ -41,13 +110,17 @@ def main(args):
     video = [video[i] for i in range(num_frames)]
     
     reference_image = None
+    if args.reference_image:
+        reference_image = Image.open(args.reference_image).convert("RGB").resize((args.width, args.height))
 
     video = pipe(
         prompt=args.prompt,
-        negative_prompt="色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走",
+        negative_prompt=args.negative_prompt,
         vace_video=video,
         vace_reference_image=reference_image,
         num_frames=num_frames,
+        num_inference_steps=args.num_inference_steps,
+        cfg_scale=args.cfg_scale,
         seed=args.seed,
         tiled=True,
     )
@@ -57,6 +130,24 @@ def main(args):
         os.makedirs(output_dir, exist_ok=True)
     
     save_video(video, args.output_video, fps=args.fps, quality=args.quality)
+    metadata = {
+        "checkpoint_path": args.checkpoint_path or "Wan-AI/Wan2.1-VACE-14B",
+        "input_video": args.input_video,
+        "control_video": args.control_video or "",
+        "reference_image": args.reference_image or "",
+        "output_video": args.output_video,
+        "prompt": args.prompt,
+        "negative_prompt": args.negative_prompt,
+        "lora_paths": lora_paths,
+        "lora_alphas": lora_alphas,
+        "resolution": [args.width, args.height],
+        "num_frames": num_frames,
+        "fps": args.fps,
+        "seed": args.seed,
+        "num_inference_steps": args.num_inference_steps,
+        "cfg_scale": args.cfg_scale,
+    }
+    print(json.dumps(metadata, ensure_ascii=False))
 
 
 if __name__ == "__main__":
@@ -64,15 +155,22 @@ if __name__ == "__main__":
 
     parser.add_argument("--input_video", type=str, required=True, help="Path to the input video file.")
     parser.add_argument("--output_video", type=str, required=True, help="Path to save the output video file.")
-    parser.add_argument("--lora_path", type=str, default=None, help="Optional path to a LoRA model file (.safetensors).")
+    parser.add_argument("--checkpoint_path", type=str, default="", help="Optional local Wan2.1-VACE-14B checkpoint directory.")
+    parser.add_argument("--control_video", type=str, default="", help="Optional control/depth video path. Defaults to input_video when omitted.")
+    parser.add_argument("--reference_image", type=str, default="", help="Optional reference image path.")
+    parser.add_argument("--lora_path", action="append", default=[], help="Optional LoRA path. Can be provided multiple times or as a comma-separated list.")
     parser.add_argument("--device_id", type=int, default=0, help="The ID of the CUDA device to use (e.g., 0, 1, 2).")
     parser.add_argument("--prompt", type=str, required=True, help="The positive prompt describing the target style.")
+    parser.add_argument("--negative_prompt", type=str, default=DEFAULT_NEGATIVE_PROMPT, help="Negative prompt.")
     parser.add_argument("--height", type=int, default=480, help="The height to use for video processing.")
     parser.add_argument("--width", type=int, default=832, help="The width to use for video processing.")
     parser.add_argument("--num_frames", type=int, default=73, help="The number of video frames to process.")
+    parser.add_argument("--num_inference_steps", type=int, default=20, help="Number of diffusion sampling steps.")
+    parser.add_argument("--cfg_scale", type=float, default=1.0, help="Classifier-free guidance scale.")
     parser.add_argument("--seed", type=int, default=1, help="Random seed for reproducible results.")
 
-    parser.add_argument("--lora_alpha", type=float, default=1.0, help="The alpha (weight) value for the LoRA model.")
+    parser.add_argument("--lora_alpha", action="append", default=[], help="Optional alpha for each LoRA. Provide one value to share across all LoRAs.")
+    parser.add_argument("--default_lora_alpha", type=float, default=1.0, help="Fallback alpha when lora_alpha is omitted.")
     parser.add_argument("--fps", type=int, default=20, help="Frames per second (FPS) for the output video.")
     parser.add_argument("--quality", type=int, default=5, help="Quality of the output video (CRF value, lower is better).")
 

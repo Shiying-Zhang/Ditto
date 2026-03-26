@@ -42,6 +42,7 @@ class HuggingfaceTokenizer:
         self.clean = clean
 
         # init tokenizer
+        kwargs.setdefault("use_fast", True)
         self.tokenizer = AutoTokenizer.from_pretrained(name, **kwargs)
         self.vocab_size = self.tokenizer.vocab_size
 

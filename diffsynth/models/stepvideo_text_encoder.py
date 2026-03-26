@@ -18,7 +18,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .stepvideo_dit import RMSNorm
 from safetensors.torch import load_file
-from transformers.modeling_utils import PretrainedConfig, PreTrainedModel
+from transformers import PretrainedConfig
+from transformers.modeling_utils import PreTrainedModel
 from einops import rearrange
 import json
 from typing import List
@@ -550,4 +551,3 @@ class STEP1TextEncoder(torch.nn.Module):
             )
             y_mask = txt_tokens.attention_mask
         return y.transpose(0,1), y_mask
-
