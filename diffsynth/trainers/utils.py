@@ -547,20 +547,37 @@ def launch_training_task(
         gradient_accumulation_steps=gradient_accumulation_steps,
         kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=find_unused_parameters)],
     )
+    print(
+        f"[train] accelerator.device={accelerator.device} "
+        f"cuda_available={torch.cuda.is_available()} "
+        f"dataset_len={len(dataset)} num_workers={num_workers} "
+        f"grad_accum={gradient_accumulation_steps}",
+        flush=True,
+    )
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
+    print("[train] accelerator.prepare done", flush=True)
     
     for epoch_id in range(num_epochs):
-        for data in tqdm(dataloader):
+        print(f"[train] epoch_start epoch={epoch_id}", flush=True)
+        for step_id, data in enumerate(tqdm(dataloader)):
+            if step_id == 0:
+                print(f"[train] first_batch_loaded epoch={epoch_id}", flush=True)
             with accelerator.accumulate(model):
                 optimizer.zero_grad()
                 if dataset.load_from_cache:
                     loss = model({}, inputs=data)
                 else:
                     loss = model(data)
+                if step_id == 0:
+                    print(f"[train] first_forward_done epoch={epoch_id} loss={float(loss.detach().item()):.6f}", flush=True)
                 accelerator.backward(loss)
+                if step_id == 0:
+                    print(f"[train] first_backward_done epoch={epoch_id}", flush=True)
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, save_steps)
                 scheduler.step()
+                if step_id == 0:
+                    print(f"[train] first_optimizer_step_done epoch={epoch_id}", flush=True)
         if save_steps is None:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
     model_logger.on_training_end(accelerator, model, save_steps)
@@ -595,6 +612,8 @@ def wan_parser():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument("--dataset_base_path", type=str, default="", required=True, help="Base path of the dataset.")
     parser.add_argument("--dataset_metadata_path", type=str, default=None, help="Path to the metadata file of the dataset.")
+    parser.add_argument("--tokenizer_path", type=str, default=None, help="Path to local tokenizer files. If set, skip remote tokenizer download.")
+    parser.add_argument("--model_init_device", type=str, default="cpu", help="Device used during from_pretrained model initialization.")
     parser.add_argument("--max_pixels", type=int, default=1280*720, help="Maximum number of pixels per frame, used for dynamic resolution..")
     parser.add_argument("--height", type=int, default=None, help="Height of images or videos. Leave `height` and `width` empty to enable dynamic resolution.")
     parser.add_argument("--width", type=int, default=None, help="Width of images or videos. Leave `height` and `width` empty to enable dynamic resolution.")

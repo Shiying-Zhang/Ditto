@@ -11,6 +11,8 @@ class WanTrainingModule(DiffusionTrainingModule):
     def __init__(
         self,
         model_paths=None, model_id_with_origin_paths=None,
+        tokenizer_path=None,
+        model_init_device="cpu",
         trainable_models=None,
         lora_base_model=None, lora_target_modules="q,k,v,o,ffn.0,ffn.2", lora_rank=32, lora_checkpoint=None,
         use_gradient_checkpointing=True,
@@ -21,15 +23,27 @@ class WanTrainingModule(DiffusionTrainingModule):
     ):
         super().__init__()
         # Load models
+        print("[WanTrainingModule] parse_model_configs start", flush=True)
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, enable_fp8_training=False)
-        self.pipe = WanVideoPipeline.from_pretrained(torch_dtype=torch.bfloat16, device="cpu", model_configs=model_configs)
+        print("[WanTrainingModule] parse_model_configs done", flush=True)
+        tokenizer_config = ModelConfig(path=tokenizer_path) if tokenizer_path is not None else None
+        print("[WanTrainingModule] from_pretrained start", flush=True)
+        self.pipe = WanVideoPipeline.from_pretrained(
+            torch_dtype=torch.bfloat16,
+            device=model_init_device,
+            model_configs=model_configs,
+            tokenizer_config=tokenizer_config,
+        )
+        print("[WanTrainingModule] from_pretrained done", flush=True)
         
         # Training mode
+        print("[WanTrainingModule] switch_pipe_to_training_mode start", flush=True)
         self.switch_pipe_to_training_mode(
             self.pipe, trainable_models,
             lora_base_model, lora_target_modules, lora_rank, lora_checkpoint=lora_checkpoint,
             enable_fp8_training=False,
         )
+        print("[WanTrainingModule] switch_pipe_to_training_mode done", flush=True)
         
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -92,6 +106,7 @@ class WanTrainingModule(DiffusionTrainingModule):
 if __name__ == "__main__":
     parser = wan_parser()
     args = parser.parse_args()
+    print("[train.py] building dataset", flush=True)
     dataset = UnifiedDataset(
         base_path=args.dataset_base_path,
         metadata_path=args.dataset_metadata_path,
@@ -112,9 +127,13 @@ if __name__ == "__main__":
             "animate_face_video": ToAbsolutePath(args.dataset_base_path) >> LoadVideo(args.num_frames, 4, 1, frame_processor=ImageCropAndResize(512, 512, None, 16, 16))
         }
     )
+    print(f"[train.py] dataset ready len={len(dataset)}", flush=True)
+    print("[train.py] building model", flush=True)
     model = WanTrainingModule(
         model_paths=args.model_paths,
         model_id_with_origin_paths=args.model_id_with_origin_paths,
+        tokenizer_path=args.tokenizer_path,
+        model_init_device=args.model_init_device,
         trainable_models=args.trainable_models,
         lora_base_model=args.lora_base_model,
         lora_target_modules=args.lora_target_modules,
@@ -125,8 +144,11 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
     )
+    print("[train.py] model ready", flush=True)
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt
     )
+    print("[train.py] launching training task", flush=True)
     launch_training_task(dataset, model, model_logger, args=args)
+    print("[train.py] training task finished", flush=True)
