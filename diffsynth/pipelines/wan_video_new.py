@@ -1,4 +1,4 @@
-import torch, warnings, glob, os, types
+import torch, warnings, glob, os, types, time
 import numpy as np
 from PIL import Image
 from einops import repeat, reduce
@@ -348,6 +348,7 @@ class WanVideoPipeline(BasePipeline):
         redirect_common_files: bool = True,
         use_usp=False,
     ):
+        fp_start = time.time()
         # Redirect model path
         if redirect_common_files:
             redirect_dict = {
@@ -363,20 +364,32 @@ class WanVideoPipeline(BasePipeline):
                     model_config.model_id = redirect_dict[model_config.origin_file_pattern]
         
         # Initialize pipeline
+        print(f"[WanVideoPipeline.from_pretrained] init pipeline device={device} dtype={torch_dtype}", flush=True)
         pipe = WanVideoPipeline(device=device, torch_dtype=torch_dtype)
         if use_usp: pipe.initialize_usp()
+        print(f"[WanVideoPipeline.from_pretrained] pipeline ready in {time.time() - fp_start:.2f}s", flush=True)
         
         # Download and load models
         model_manager = ModelManager()
-        for model_config in model_configs:
+        for idx, model_config in enumerate(model_configs):
+            model_start = time.time()
+            print(
+                f"[WanVideoPipeline.from_pretrained] model_config[{idx}] start "
+                f"path={getattr(model_config, 'path', None)} model_id={getattr(model_config, 'model_id', None)} "
+                f"origin={getattr(model_config, 'origin_file_pattern', None)}",
+                flush=True,
+            )
             model_config.download_if_necessary(use_usp=use_usp)
+            print(f"[WanVideoPipeline.from_pretrained] model_config[{idx}] download_if_necessary done in {time.time() - model_start:.2f}s", flush=True)
             model_manager.load_model(
                 model_config.path,
                 device=model_config.offload_device or device,
                 torch_dtype=model_config.offload_dtype or torch_dtype
             )
+            print(f"[WanVideoPipeline.from_pretrained] model_config[{idx}] load_model done in {time.time() - model_start:.2f}s", flush=True)
         
         # Load models
+        fetch_start = time.time()
         pipe.text_encoder = model_manager.fetch_model("wan_video_text_encoder")
         dit = model_manager.fetch_model("wan_video_dit", index=2)
         if isinstance(dit, list):
@@ -393,6 +406,7 @@ class WanVideoPipeline(BasePipeline):
             pipe.vace = vace
         pipe.audio_encoder = model_manager.fetch_model("wans2v_audio_encoder")
         pipe.animate_adapter = model_manager.fetch_model("wan_video_animate_adapter")
+        print(f"[WanVideoPipeline.from_pretrained] fetch_model stage done in {time.time() - fetch_start:.2f}s", flush=True)
 
         # Size division factor
         if pipe.vae is not None:
@@ -400,9 +414,13 @@ class WanVideoPipeline(BasePipeline):
             pipe.width_division_factor = pipe.vae.upsampling_factor * 2
 
         # Initialize tokenizer
+        tok_start = time.time()
         tokenizer_config.download_if_necessary(use_usp=use_usp)
+        print(f"[WanVideoPipeline.from_pretrained] tokenizer download_if_necessary done in {time.time() - tok_start:.2f}s", flush=True)
         pipe.prompter.fetch_models(pipe.text_encoder)
+        print(f"[WanVideoPipeline.from_pretrained] prompter.fetch_models done in {time.time() - tok_start:.2f}s", flush=True)
         pipe.prompter.fetch_tokenizer(tokenizer_config.path)
+        print(f"[WanVideoPipeline.from_pretrained] prompter.fetch_tokenizer done in {time.time() - tok_start:.2f}s", flush=True)
 
         if audio_processor_config is not None:
             audio_processor_config.download_if_necessary(use_usp=use_usp)
@@ -410,6 +428,7 @@ class WanVideoPipeline(BasePipeline):
             pipe.audio_processor = Wav2Vec2Processor.from_pretrained(audio_processor_config.path)
         # Unified Sequence Parallel
         if use_usp: pipe.enable_usp()
+        print(f"[WanVideoPipeline.from_pretrained] total time {time.time() - fp_start:.2f}s", flush=True)
         return pipe
 
 

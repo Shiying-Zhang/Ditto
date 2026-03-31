@@ -1,4 +1,4 @@
-import os, torch, json, importlib
+import os, torch, json, importlib, time
 from typing import List
 
 from .downloader import download_models, download_customized_models, Preset_model_id, Preset_model_website
@@ -394,18 +394,26 @@ class ModelManager:
 
     def load_model(self, file_path, model_names=None, device=None, torch_dtype=None):
         print(f"Loading models from: {file_path}")
+        start_time = time.time()
         if device is None: device = self.device
         if torch_dtype is None: torch_dtype = self.torch_dtype
         if isinstance(file_path, list):
+            print(f"    Aggregating {len(file_path)} shard files", flush=True)
             state_dict = {}
             for path in file_path:
+                shard_start = time.time()
+                print(f"    Loading shard: {path}", flush=True)
                 state_dict.update(load_state_dict(path))
+                print(f"    Loaded shard in {time.time() - shard_start:.2f}s: {path}", flush=True)
         elif os.path.isfile(file_path):
             state_dict = load_state_dict(file_path)
         else:
             state_dict = None
+        print(f"    State dict ready in {time.time() - start_time:.2f}s", flush=True)
         for model_detector in self.model_detector:
             if model_detector.match(file_path, state_dict):
+                detector_start = time.time()
+                print(f"    Matched detector: {model_detector.__class__.__name__}", flush=True)
                 model_names, models = model_detector.load(
                     file_path, state_dict,
                     device=device, torch_dtype=torch_dtype,
@@ -416,6 +424,8 @@ class ModelManager:
                     self.model_path.append(file_path)
                     self.model_name.append(model_name)
                 print(f"    The following models are loaded: {model_names}.")
+                print(f"    Detector load finished in {time.time() - detector_start:.2f}s", flush=True)
+                print(f"    Total load_model time {time.time() - start_time:.2f}s", flush=True)
                 break
         else:
             print(f"    We cannot detect the model type. No models are loaded.")
@@ -464,4 +474,3 @@ class ModelManager:
     def to(self, device):
         for model in self.model:
             model.to(device)
-
