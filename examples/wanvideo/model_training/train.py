@@ -1,5 +1,11 @@
 import torch, os, json
 from diffsynth import load_state_dict
+from diffsynth.models.latent_memory import (
+    LatentMemoryContextAdapter,
+    LatentMemoryHintAdapter,
+    LatentMemoryTextAdapter,
+    extract_latent_memory_state_dict,
+)
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
 from diffsynth.trainers.unified_dataset import UnifiedDataset, LoadVideo, ImageCropAndResize, ToAbsolutePath
@@ -15,6 +21,64 @@ def resolve_model_init_device(model_init_device):
     return f"cuda:{int(local_rank)}"
 
 
+def attach_latent_memory(
+    pipe,
+    mode="none",
+    num_tokens=4,
+    hidden_dim=0,
+    scale=1.0,
+    init_std=0.02,
+):
+    mode = str(mode or "none")
+    if mode == "none":
+        return None, []
+    dtype = getattr(pipe, "torch_dtype", torch.bfloat16)
+    device = getattr(pipe, "device", "cpu")
+    if mode == "text":
+        text_dim = pipe.dit.text_embedding[0].in_features
+        adapter = LatentMemoryTextAdapter(text_dim, num_tokens, hidden_dim, scale, init_std)
+        pipe.latent_memory_text = adapter
+        prefixes = ["pipe.latent_memory_text", "latent_memory_text"]
+    elif mode == "vace_context":
+        if getattr(pipe, "vace", None) is None:
+            raise ValueError("latent_memory_mode=vace_context requires pipe.vace")
+        adapter = LatentMemoryContextAdapter(pipe.dit.dim, num_tokens, hidden_dim, scale, init_std)
+        pipe.vace.latent_memory_context = adapter
+        prefixes = ["pipe.vace.latent_memory_context", "latent_memory_context"]
+    elif mode == "vace_hint":
+        if getattr(pipe, "vace", None) is None:
+            raise ValueError("latent_memory_mode=vace_hint requires pipe.vace")
+        adapter = LatentMemoryHintAdapter(pipe.dit.dim, len(pipe.vace.vace_layers), num_tokens, hidden_dim, scale, init_std)
+        pipe.vace.latent_memory_hint = adapter
+        prefixes = ["pipe.vace.latent_memory_hint", "latent_memory_hint"]
+    else:
+        raise ValueError(f"Unknown latent_memory_mode: {mode}")
+    adapter.to(device=device, dtype=dtype)
+    for param in adapter.parameters():
+        param.requires_grad_(True)
+    param_count = sum(param.numel() for param in adapter.parameters() if param.requires_grad)
+    print(f"[WanTrainingModule] latent_memory attached mode={mode} trainable_params={param_count}", flush=True)
+    return adapter, prefixes
+
+
+def load_latent_memory_checkpoint(adapter, checkpoint, prefixes, required=False):
+    if adapter is None or checkpoint is None:
+        return
+    state_dict = load_state_dict(checkpoint)
+    adapter_state = adapter.state_dict()
+    latent_state = extract_latent_memory_state_dict(state_dict, adapter_state.keys(), prefixes)
+    if not latent_state:
+        if required:
+            print(f"[WanTrainingModule] warning: no latent_memory keys found in {checkpoint}", flush=True)
+        return
+    load_result = adapter.load_state_dict(latent_state, strict=False)
+    print(f"[WanTrainingModule] latent_memory checkpoint loaded: {checkpoint}, total {len(latent_state)} keys", flush=True)
+    if len(load_result[0]) > 0:
+        print(f"[WanTrainingModule] warning: missing latent_memory keys: {load_result[0]}", flush=True)
+    if len(load_result[1]) > 0:
+        print(f"[WanTrainingModule] warning: unexpected latent_memory keys: {load_result[1]}", flush=True)
+
+
 
 class WanTrainingModule(DiffusionTrainingModule):
     def __init__(
@@ -24,6 +88,8 @@ class WanTrainingModule(DiffusionTrainingModule):
         model_init_device="cpu",
         trainable_models=None,
         lora_base_model=None, lora_target_modules="q,k,v,o,ffn.0,ffn.2", lora_rank=32, lora_checkpoint=None,
+        latent_memory_mode="none", latent_memory_tokens=4, latent_memory_hidden_dim=0,
+        latent_memory_scale=1.0, latent_memory_init_std=0.02, latent_memory_checkpoint=None,
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
@@ -55,6 +121,20 @@ class WanTrainingModule(DiffusionTrainingModule):
             enable_fp8_training=False,
         )
         print("[WanTrainingModule] switch_pipe_to_training_mode done", flush=True)
+        adapter, prefixes = attach_latent_memory(
+            self.pipe,
+            mode=latent_memory_mode,
+            num_tokens=latent_memory_tokens,
+            hidden_dim=latent_memory_hidden_dim,
+            scale=latent_memory_scale,
+            init_std=latent_memory_init_std,
+        )
+        load_latent_memory_checkpoint(
+            adapter,
+            latent_memory_checkpoint or lora_checkpoint,
+            prefixes,
+            required=latent_memory_checkpoint is not None,
+        )
         
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -150,6 +230,12 @@ if __name__ == "__main__":
         lora_target_modules=args.lora_target_modules,
         lora_rank=args.lora_rank,
         lora_checkpoint=args.lora_checkpoint,
+        latent_memory_mode=args.latent_memory_mode,
+        latent_memory_tokens=args.latent_memory_tokens,
+        latent_memory_hidden_dim=args.latent_memory_hidden_dim,
+        latent_memory_scale=args.latent_memory_scale,
+        latent_memory_init_std=args.latent_memory_init_std,
+        latent_memory_checkpoint=args.latent_memory_checkpoint,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         extra_inputs=args.extra_inputs,
         max_timestep_boundary=args.max_timestep_boundary,

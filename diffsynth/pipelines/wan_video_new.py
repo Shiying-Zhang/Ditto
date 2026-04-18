@@ -646,6 +646,9 @@ class WanVideoUnit_PromptEmbedder(PipelineUnit):
     def process(self, pipe: WanVideoPipeline, prompt, positive) -> dict:
         pipe.load_models_to_device(self.onload_model_names)
         prompt_emb = pipe.prompter.encode_prompt(prompt, positive=positive, device=pipe.device)
+        latent_memory = getattr(pipe, "latent_memory_text", None)
+        if latent_memory is not None:
+            prompt_emb = latent_memory(prompt_emb)
         return {"context": prompt_emb}
 
 
@@ -1462,7 +1465,11 @@ def model_fn_wan_video(
             
             # VACE
             if vace_context is not None and block_id in vace.vace_layers_mapping:
-                current_vace_hint = vace_hints[vace.vace_layers_mapping[block_id]]
+                hint_index = vace.vace_layers_mapping[block_id]
+                current_vace_hint = vace_hints[hint_index]
+                latent_memory = getattr(vace, "latent_memory_hint", None)
+                if latent_memory is not None:
+                    current_vace_hint = latent_memory(current_vace_hint, context, hint_index=hint_index, block_id=block_id)
                 if use_unified_sequence_parallel and dist.is_initialized() and dist.get_world_size() > 1:
                     current_vace_hint = torch.chunk(current_vace_hint, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
                     current_vace_hint = torch.nn.functional.pad(current_vace_hint, (0, 0, 0, chunks[0].shape[1] - current_vace_hint.shape[1]), value=0)

@@ -61,6 +61,9 @@ class VaceWanModel(torch.nn.Module):
             torch.cat([u, u.new_zeros(1, x.shape[1] - u.size(1), u.size(2))],
                       dim=1) for u in c
         ])
+        latent_memory = getattr(self, "latent_memory_context", None)
+        if latent_memory is not None:
+            c = latent_memory(c, context)
         
         def create_custom_forward(module):
             def custom_forward(*inputs):
