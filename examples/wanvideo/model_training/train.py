@@ -6,6 +6,15 @@ from diffsynth.trainers.unified_dataset import UnifiedDataset, LoadVideo, ImageC
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
+def resolve_model_init_device(model_init_device):
+    if model_init_device != "cuda":
+        return model_init_device
+    local_rank = os.getenv("LOCAL_RANK")
+    if local_rank is None or not torch.cuda.is_available():
+        return model_init_device
+    return f"cuda:{int(local_rank)}"
+
+
 
 class WanTrainingModule(DiffusionTrainingModule):
     def __init__(
@@ -27,10 +36,12 @@ class WanTrainingModule(DiffusionTrainingModule):
         model_configs = self.parse_model_configs(model_paths, model_id_with_origin_paths, enable_fp8_training=False)
         print("[WanTrainingModule] parse_model_configs done", flush=True)
         tokenizer_config = ModelConfig(path=tokenizer_path) if tokenizer_path is not None else None
+        resolved_model_init_device = resolve_model_init_device(model_init_device)
+        print(f"[WanTrainingModule] resolved model_init_device={resolved_model_init_device}", flush=True)
         print("[WanTrainingModule] from_pretrained start", flush=True)
         self.pipe = WanVideoPipeline.from_pretrained(
             torch_dtype=torch.bfloat16,
-            device=model_init_device,
+            device=resolved_model_init_device,
             model_configs=model_configs,
             tokenizer_config=tokenizer_config,
         )
