@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from diffsynth import save_video, VideoData
+from diffsynth.models.latent_memory_runtime import attach_latent_memory, load_latent_memory_checkpoint
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 
 
@@ -61,6 +62,22 @@ def _parse_multi_values(raw_values, raw_alphas, default_alpha: float) -> tuple[l
     return lora_paths, parsed_alphas
 
 
+def _resolve_latent_memory_checkpoint(args, lora_paths: list[str]) -> str:
+    if args.latent_memory_checkpoint:
+        return args.latent_memory_checkpoint
+    if args.latent_memory_mode == "none":
+        return ""
+    if not lora_paths:
+        return ""
+    if len(lora_paths) > 1:
+        print(
+            "Warning: multiple LoRA checkpoints were provided without --latent_memory_checkpoint. "
+            "Using the first LoRA checkpoint for latent memory weights.",
+            flush=True,
+        )
+    return lora_paths[0]
+
+
 def main(args):
 
     device = f"cuda:{args.device_id}"
@@ -86,6 +103,29 @@ def main(args):
         )
 
     lora_paths, lora_alphas = _parse_multi_values(args.lora_path, args.lora_alpha, args.default_lora_alpha)
+    latent_memory_checkpoint = _resolve_latent_memory_checkpoint(args, lora_paths)
+    if args.latent_memory_mode != "none":
+        adapter, prefixes = attach_latent_memory(
+            pipe,
+            mode=args.latent_memory_mode,
+            num_tokens=args.latent_memory_tokens,
+            hidden_dim=args.latent_memory_hidden_dim,
+            scale=args.latent_memory_scale,
+            init_std=args.latent_memory_init_std,
+            log_prefix="[infer_ditto] latent_memory",
+        )
+        if not latent_memory_checkpoint:
+            raise RuntimeError(
+                "latent memory inference requires --latent_memory_checkpoint, or at least one --lora_path "
+                "whose checkpoint also contains latent memory weights."
+            )
+        load_latent_memory_checkpoint(
+            adapter,
+            latent_memory_checkpoint,
+            prefixes,
+            required=True,
+            log_prefix="[infer_ditto] latent_memory",
+        )
     for lora_path, alpha in zip(lora_paths, lora_alphas):
         print(f"Loading Ditto LoRA model: {lora_path} (alpha={alpha})")
         if not os.path.exists(lora_path):
@@ -140,6 +180,12 @@ def main(args):
         "negative_prompt": args.negative_prompt,
         "lora_paths": lora_paths,
         "lora_alphas": lora_alphas,
+        "latent_memory_mode": args.latent_memory_mode,
+        "latent_memory_tokens": args.latent_memory_tokens,
+        "latent_memory_hidden_dim": args.latent_memory_hidden_dim,
+        "latent_memory_scale": args.latent_memory_scale,
+        "latent_memory_init_std": args.latent_memory_init_std,
+        "latent_memory_checkpoint": latent_memory_checkpoint,
         "resolution": [args.width, args.height],
         "num_frames": num_frames,
         "fps": args.fps,
@@ -171,6 +217,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--lora_alpha", action="append", default=[], help="Optional alpha for each LoRA. Provide one value to share across all LoRAs.")
     parser.add_argument("--default_lora_alpha", type=float, default=1.0, help="Fallback alpha when lora_alpha is omitted.")
+    parser.add_argument("--latent_memory_mode", choices=["none", "text", "vace_context", "vace_hint"], default="none", help="Attach latent memory adapter during inference.")
+    parser.add_argument("--latent_memory_tokens", type=int, default=4, help="Number of latent memory tokens.")
+    parser.add_argument("--latent_memory_hidden_dim", type=int, default=0, help="Hidden dimension for latent memory conditioning MLP. 0 uses an automatic value.")
+    parser.add_argument("--latent_memory_scale", type=float, default=1.0, help="Scale applied to latent memory output.")
+    parser.add_argument("--latent_memory_init_std", type=float, default=0.02, help="Initialization std for latent memory parameters.")
+    parser.add_argument("--latent_memory_checkpoint", type=str, default="", help="Checkpoint containing latent memory weights. Defaults to the first LoRA checkpoint when latent_memory_mode is enabled.")
     parser.add_argument("--fps", type=int, default=20, help="Frames per second (FPS) for the output video.")
     parser.add_argument("--quality", type=int, default=5, help="Quality of the output video (CRF value, lower is better).")
 
