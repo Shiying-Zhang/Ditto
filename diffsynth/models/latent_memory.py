@@ -51,6 +51,8 @@ class LatentMemoryTextAdapter(torch.nn.Module):
     def forward(self, context):
         context, squeezed = _as_batched_sequence(context)
         pooled = context.mean(dim=1)
+        self.gate.to(device=context.device, dtype=context.dtype)
+        pooled = pooled.to(device=context.device, dtype=context.dtype)
         gate = self.gate(pooled).to(dtype=context.dtype).unsqueeze(-1)
         memory = self.memory.to(dtype=context.dtype, device=context.device)
         memory = memory.unsqueeze(0).expand(context.shape[0], -1, -1)
