@@ -217,7 +217,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--lora_alpha", action="append", default=[], help="Optional alpha for each LoRA. Provide one value to share across all LoRAs.")
     parser.add_argument("--default_lora_alpha", type=float, default=1.0, help="Fallback alpha when lora_alpha is omitted.")
-    parser.add_argument("--latent_memory_mode", choices=["none", "text", "vace_context", "vace_hint"], default="none", help="Attach latent memory adapter during inference.")
+    parser.add_argument("--latent_memory_mode", default="none", help="Attach latent memory adapter during inference. Combine modes with '+', e.g. text+vace_hint.")
     parser.add_argument("--latent_memory_tokens", type=int, default=4, help="Number of latent memory tokens.")
     parser.add_argument("--latent_memory_hidden_dim", type=int, default=0, help="Hidden dimension for latent memory conditioning MLP. 0 uses an automatic value.")
     parser.add_argument("--latent_memory_scale", type=float, default=1.0, help="Scale applied to latent memory output.")

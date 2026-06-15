@@ -631,7 +631,7 @@ def wan_parser():
     parser.add_argument("--lora_target_modules", type=str, default="q,k,v,o,ffn.0,ffn.2", help="Which layers LoRA is added to.")
     parser.add_argument("--lora_rank", type=int, default=32, help="Rank of LoRA.")
     parser.add_argument("--lora_checkpoint", type=str, default=None, help="Path to the LoRA checkpoint. If provided, LoRA will be loaded from this checkpoint.")
-    parser.add_argument("--latent_memory_mode", type=str, choices=["none", "text", "vace_context", "vace_hint"], default="none", help="Prototype latent memory insertion point.")
+    parser.add_argument("--latent_memory_mode", type=str, default="none", help="Prototype latent memory insertion point. Combine modes with '+', e.g. text+vace_hint.")
     parser.add_argument("--latent_memory_tokens", type=int, default=4, help="Number of latent memory tokens.")
     parser.add_argument("--latent_memory_hidden_dim", type=int, default=0, help="Hidden dimension for latent memory conditioning MLP. 0 uses an automatic value.")
     parser.add_argument("--latent_memory_scale", type=float, default=1.0, help="Scale applied to latent memory output.")
