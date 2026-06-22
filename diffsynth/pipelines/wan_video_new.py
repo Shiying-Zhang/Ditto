@@ -105,7 +105,7 @@ class WanVideoPipeline(BasePipeline):
             loader = GeneralLoRALoader(torch_dtype=self.torch_dtype, device=self.device)
             loader.load(module, lora, alpha=alpha)
         
-    def training_loss(self, **inputs):
+    def training_loss(self, return_outputs=False, **inputs):
         max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * self.scheduler.num_train_timesteps)
         min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * self.scheduler.num_train_timesteps)
         timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
@@ -118,7 +118,20 @@ class WanVideoPipeline(BasePipeline):
         
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
         loss = loss * self.scheduler.training_weight(timestep)
-        return loss
+        if not return_outputs:
+            return loss
+        sigma = self.scheduler.sigmas[timestep_id].to(dtype=noise_pred.dtype, device=noise_pred.device)
+        while sigma.dim() < noise_pred.dim():
+            sigma = sigma.view(*sigma.shape, *([1] * (noise_pred.dim() - sigma.dim())))
+        pred_x0 = inputs["latents"] - sigma * noise_pred
+        return {
+            "loss": loss,
+            "noise_pred": noise_pred,
+            "training_target": training_target,
+            "pred_x0": pred_x0,
+            "target_x0": inputs["input_latents"],
+            "timestep": timestep,
+        }
 
 
     def enable_vram_management(self, num_persistent_param_in_dit=None, vram_limit=None, vram_buffer=0.5):

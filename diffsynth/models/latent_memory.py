@@ -39,6 +39,8 @@ class LatentMemoryTextAdapter(torch.nn.Module):
         self.num_tokens = int(num_tokens)
         self.scale = float(scale)
         self.memory = torch.nn.Parameter(torch.empty(num_tokens, text_dim))
+        self.last_route_probs = None
+        self.route_probs_history = []
         self.gate = torch.nn.Sequential(
             torch.nn.LayerNorm(text_dim),
             torch.nn.Linear(text_dim, hidden_dim),
@@ -53,7 +55,11 @@ class LatentMemoryTextAdapter(torch.nn.Module):
         pooled = context.mean(dim=1)
         self.gate.to(device=context.device, dtype=context.dtype)
         pooled = pooled.to(device=context.device, dtype=context.dtype)
-        gate = self.gate(pooled).to(dtype=context.dtype).unsqueeze(-1)
+        gate = self.gate(pooled).to(dtype=context.dtype)
+        route_probs = gate / gate.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        self.last_route_probs = route_probs
+        self.route_probs_history = [route_probs]
+        gate = gate.unsqueeze(-1)
         memory = self.memory.to(dtype=context.dtype, device=context.device)
         memory = memory.unsqueeze(0).expand(context.shape[0], -1, -1)
         memory = memory * gate * self.scale
@@ -73,6 +79,8 @@ class LatentMemoryContextAdapter(torch.nn.Module):
         self.num_tokens = int(num_tokens)
         self.scale = float(scale)
         self.memory = torch.nn.Parameter(torch.empty(num_tokens, dim))
+        self.last_route_probs = None
+        self.route_probs_history = []
         self.selector = torch.nn.Sequential(
             torch.nn.LayerNorm(dim),
             torch.nn.Linear(dim, hidden_dim),
@@ -84,6 +92,8 @@ class LatentMemoryContextAdapter(torch.nn.Module):
     def _memory_delta(self, context, batch_size):
         pooled, _ = _mean_pool_sequence(context)
         weights = torch.softmax(self.selector(pooled), dim=-1).to(dtype=context.dtype)
+        self.last_route_probs = weights
+        self.route_probs_history = [weights]
         memory = self.memory.to(dtype=context.dtype, device=context.device)
         delta = weights @ memory
         return _match_batch(delta, batch_size)
@@ -109,6 +119,8 @@ class LatentMemoryHintAdapter(torch.nn.Module):
         self.num_tokens = int(num_tokens)
         self.scale = float(scale)
         self.memory = torch.nn.Parameter(torch.empty(num_layers, num_tokens, dim))
+        self.last_route_probs = None
+        self.route_probs_history = []
         self.selector = torch.nn.Sequential(
             torch.nn.LayerNorm(dim),
             torch.nn.Linear(dim, hidden_dim),
@@ -124,6 +136,12 @@ class LatentMemoryHintAdapter(torch.nn.Module):
             raise IndexError(f"hint_index {hint_index} out of range for {self.num_layers} latent-memory layers")
         pooled, _ = _mean_pool_sequence(context)
         weights = torch.softmax(self.selector(pooled), dim=-1).to(dtype=hint.dtype)
+        self.last_route_probs = weights
+        history = getattr(self, "route_probs_history", None)
+        if history is None or hint_index == 0:
+            history = []
+        history.append(weights)
+        self.route_probs_history = history
         memory = self.memory[hint_index].to(dtype=hint.dtype, device=hint.device)
         delta = weights @ memory
         delta = _match_batch(delta, hint.shape[0])

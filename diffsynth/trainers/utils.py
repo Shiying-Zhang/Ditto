@@ -569,7 +569,9 @@ def launch_training_task(
                 else:
                     loss = model(data)
                 if step_id == 0:
-                    print(f"[train] first_forward_done epoch={epoch_id} loss={float(loss.detach().item()):.6f}", flush=True)
+                    aux_summary = getattr(model, "_last_aux_loss_summary", "")
+                    aux_suffix = f" aux=({aux_summary})" if aux_summary else ""
+                    print(f"[train] first_forward_done epoch={epoch_id} loss={float(loss.detach().item()):.6f}{aux_suffix}", flush=True)
                 accelerator.backward(loss)
                 if step_id == 0:
                     print(f"[train] first_backward_done epoch={epoch_id}", flush=True)
@@ -637,6 +639,15 @@ def wan_parser():
     parser.add_argument("--latent_memory_scale", type=float, default=1.0, help="Scale applied to latent memory output.")
     parser.add_argument("--latent_memory_init_std", type=float, default=0.02, help="Initialization std for latent memory parameters.")
     parser.add_argument("--latent_memory_checkpoint", type=str, default=None, help="Optional checkpoint containing latent memory weights. If omitted, --lora_checkpoint is also scanned for latent memory keys.")
+    parser.add_argument("--aux_loss_preset", type=str, default="none", choices=["none", "codebook_gate", "latent_align", "all"], help="Optional auxiliary loss bundle. Defaults to none to preserve legacy training.")
+    parser.add_argument("--latent_memory_code_diversity_weight", type=float, default=0.0, help="Weight for latent-memory code orthogonality/diversity loss.")
+    parser.add_argument("--latent_memory_gate_entropy_weight", type=float, default=0.0, help="Weight for per-sample route entropy loss. Minimizing this encourages sparse code selection.")
+    parser.add_argument("--latent_memory_gate_usage_weight", type=float, default=0.0, help="Weight for batch-level route usage-balance loss.")
+    parser.add_argument("--latent_feature_alignment_weight", type=float, default=0.0, help="Weight for pred-x0 vs target-latent cosine alignment proxy.")
+    parser.add_argument("--latent_feature_alignment_margin", type=float, default=0.0, help="Margin for pred-x0 vs target-latent cosine alignment proxy.")
+    parser.add_argument("--latent_feature_relation_weight", type=float, default=0.0, help="Weight for pred-x0 vs target-latent pairwise relation alignment proxy.")
+    parser.add_argument("--latent_feature_relation_margin", type=float, default=0.0, help="Margin for latent pairwise relation alignment proxy.")
+    parser.add_argument("--latent_feature_relation_max_tokens", type=int, default=256, help="Maximum latent tokens sampled for pairwise relation alignment.")
     parser.add_argument("--extra_inputs", default=None, help="Additional model inputs, comma-separated.")
     parser.add_argument("--use_gradient_checkpointing_offload", default=False, action="store_true", help="Whether to offload gradient checkpointing to CPU memory.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
