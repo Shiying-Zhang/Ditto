@@ -483,12 +483,17 @@ class ModelLogger:
         self.remove_prefix_in_ckpt = remove_prefix_in_ckpt
         self.state_dict_converter = state_dict_converter
         self.num_steps = 0
+        self.saved_step_ids = set()
 
 
-    def on_step_end(self, accelerator, model, save_steps=None):
+    def on_step_end(self, accelerator, model, save_steps=None, save_step_list=None):
         self.num_steps += 1
-        if save_steps is not None and self.num_steps % save_steps == 0:
+        save_step_list = set() if save_step_list is None else set(save_step_list)
+        periodic_save = save_steps is not None and save_steps > 0 and self.num_steps % save_steps == 0
+        milestone_save = self.num_steps in save_step_list
+        if periodic_save or milestone_save:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+            self.saved_step_ids.add(self.num_steps)
 
 
     def on_epoch_end(self, accelerator, model, epoch_id):
@@ -502,9 +507,11 @@ class ModelLogger:
             accelerator.save(state_dict, path, safe_serialization=True)
 
 
-    def on_training_end(self, accelerator, model, save_steps=None):
-        if save_steps is not None and self.num_steps % save_steps != 0:
+    def on_training_end(self, accelerator, model, save_steps=None, save_step_list=None):
+        del save_steps, save_step_list
+        if self.num_steps > 0 and self.num_steps not in self.saved_step_ids:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")
+            self.saved_step_ids.add(self.num_steps)
 
 
     def save_model(self, accelerator, model, file_name):
@@ -529,6 +536,8 @@ def launch_training_task(
     num_epochs: int = 1,
     gradient_accumulation_steps: int = 1,
     find_unused_parameters: bool = False,
+    max_train_steps: int = 0,
+    save_step_list = None,
     args = None,
 ):
     if args is not None:
@@ -539,6 +548,13 @@ def launch_training_task(
         num_epochs = args.num_epochs
         gradient_accumulation_steps = args.gradient_accumulation_steps
         find_unused_parameters = args.find_unused_parameters
+        max_train_steps = int(args.max_train_steps or 0)
+        save_step_list = [
+            int(item.strip())
+            for item in str(args.save_step_list or "").split(",")
+            if item.strip()
+        ]
+    save_step_list = [] if save_step_list is None else save_step_list
     
     optimizer = torch.optim.AdamW(model.trainable_modules(), lr=learning_rate, weight_decay=weight_decay)
     scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
@@ -557,6 +573,7 @@ def launch_training_task(
     model, optimizer, dataloader, scheduler = accelerator.prepare(model, optimizer, dataloader, scheduler)
     print("[train] accelerator.prepare done", flush=True)
     
+    reached_max_steps = False
     for epoch_id in range(num_epochs):
         print(f"[train] epoch_start epoch={epoch_id}", flush=True)
         for step_id, data in enumerate(tqdm(dataloader)):
@@ -576,13 +593,31 @@ def launch_training_task(
                 if step_id == 0:
                     print(f"[train] first_backward_done epoch={epoch_id}", flush=True)
                 optimizer.step()
-                model_logger.on_step_end(accelerator, model, save_steps)
-                scheduler.step()
+                if accelerator.sync_gradients:
+                    model_logger.on_step_end(
+                        accelerator,
+                        model,
+                        save_steps=save_steps,
+                        save_step_list=save_step_list,
+                    )
+                    scheduler.step()
+                    if max_train_steps > 0 and model_logger.num_steps >= max_train_steps:
+                        reached_max_steps = True
                 if step_id == 0:
                     print(f"[train] first_optimizer_step_done epoch={epoch_id}", flush=True)
-        if save_steps is None:
+            if reached_max_steps:
+                break
+        if save_steps is None and not save_step_list:
             model_logger.on_epoch_end(accelerator, model, epoch_id)
-    model_logger.on_training_end(accelerator, model, save_steps)
+        if reached_max_steps:
+            print(f"[train] reached max_train_steps={max_train_steps}", flush=True)
+            break
+    model_logger.on_training_end(
+        accelerator,
+        model,
+        save_steps=save_steps,
+        save_step_list=save_step_list,
+    )
 
 
 def launch_data_process_task(
@@ -655,6 +690,8 @@ def wan_parser():
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary (for mixed models, e.g., Wan-AI/Wan2.2-I2V-A14B).")
     parser.add_argument("--find_unused_parameters", default=False, action="store_true", help="Whether to find unused parameters in DDP.")
     parser.add_argument("--save_steps", type=int, default=None, help="Number of checkpoint saving invervals. If None, checkpoints will be saved every epoch.")
+    parser.add_argument("--save_step_list", type=str, default="", help="Comma-separated optimizer steps to save in addition to --save_steps, e.g. 2500,7500.")
+    parser.add_argument("--max_train_steps", type=int, default=0, help="Stop after this many optimizer updates. 0 runs all configured epochs.")
     parser.add_argument("--dataset_num_workers", type=int, default=0, help="Number of workers for data loading.")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay.")
     return parser
