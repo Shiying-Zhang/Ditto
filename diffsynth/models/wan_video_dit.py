@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import math
 from typing import Tuple, Optional
 from einops import rearrange
+from .adaptive_rope_runtime import build_adaptive_rope_freqs
 from .utils import hash_state_dict_keys
 from .wan_video_camera_controller import SimpleAdapter
 try:
@@ -89,12 +90,15 @@ def precompute_freqs_cis(dim: int, end: int = 1024, theta: float = 10000.0):
     return freqs_cis
 
 
-def rope_apply(x, freqs, num_heads):
+def rope_apply(x, freqs, num_heads, flatten=True):
     x = rearrange(x, "b s (n d) -> b s n d", n=num_heads)
     x_out = torch.view_as_complex(x.to(torch.float64).reshape(
         x.shape[0], x.shape[1], x.shape[2], -1, 2))
-    x_out = torch.view_as_real(x_out * freqs).flatten(2)
-    return x_out.to(x.dtype)
+    x_out = torch.view_as_real(x_out * freqs).flatten(3)
+    x_out = x_out.to(x.dtype)
+    if flatten:
+        x_out = rearrange(x_out, "b s n d -> b s (n d)")
+    return x_out
 
 
 class RMSNorm(nn.Module):
@@ -138,11 +142,23 @@ class SelfAttention(nn.Module):
         self.attn = AttentionModule(self.num_heads)
 
     def forward(self, x, freqs):
+        rope_meta = freqs if isinstance(freqs, dict) else None
+        if rope_meta is not None:
+            freqs = rope_meta["freqs"]
         q = self.norm_q(self.q(x))
         k = self.norm_k(self.k(x))
         v = self.v(x)
-        q = rope_apply(q, freqs, self.num_heads)
-        k = rope_apply(k, freqs, self.num_heads)
+        q = rope_apply(q, freqs, self.num_heads, flatten=False)
+        k = rope_apply(k, freqs, self.num_heads, flatten=False)
+        if rope_meta is not None and rope_meta.get("adapter", None) is not None:
+            rope_meta["adapter"].record_attention_density(
+                rope_meta.get("block_id", 0),
+                q,
+                k,
+                rope_meta.get("grid_size", None),
+            )
+        q = rearrange(q, "b s n d -> b s (n d)")
+        k = rearrange(k, "b s n d -> b s (n d)")
         x = self.attn(q, k, v)
         return self.o(x)
 
@@ -296,6 +312,7 @@ class WanModel(torch.nn.Module):
         self.dim = dim
         self.in_dim = in_dim
         self.freq_dim = freq_dim
+        self.num_heads = num_heads
         self.has_image_input = has_image_input
         self.patch_size = patch_size
         self.seperated_timestep = seperated_timestep
@@ -371,20 +388,33 @@ class WanModel(torch.nn.Module):
             clip_embdding = self.img_emb(clip_feature)
             context = torch.cat([clip_embdding, context], dim=1)
         
+        source_for_rope = kwargs.get("source_latents", None)
+        if source_for_rope is None:
+            source_for_rope = kwargs.get("vace_context", None)
+        if source_for_rope is None:
+            source_for_rope = x
         x, (f, h, w) = self.patchify(x)
         
-        freqs = torch.cat([
-            self.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-            self.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-            self.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-        ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+        adapter = getattr(self, "sa_rope_adapter", None)
+
+        def make_freqs(block_id):
+            freqs = build_adaptive_rope_freqs(
+                self,
+                f,
+                h,
+                w,
+                source_latents=source_for_rope,
+                block_id=block_id,
+            ).to(x.device)
+            return {"freqs": freqs, "adapter": adapter, "block_id": block_id, "grid_size": (f, h, w)}
         
         def create_custom_forward(module):
             def custom_forward(*inputs):
                 return module(*inputs)
             return custom_forward
 
-        for block in self.blocks:
+        for block_id, block in enumerate(self.blocks):
+            freqs = make_freqs(block_id)
             if self.training and use_gradient_checkpointing:
                 if use_gradient_checkpointing_offload:
                     with torch.autograd.graph.save_on_cpu():

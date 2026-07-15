@@ -20,6 +20,7 @@ from ..models.wan_video_text_encoder import T5RelativeEmbedding, T5LayerNorm
 from ..models.wan_video_dit import RMSNorm, sinusoidal_embedding_1d
 from ..models.wan_video_vae import RMS_norm, CausalConv3d, Upsample
 from ..models.wan_video_motion_controller import WanMotionControllerModel
+from ..models.adaptive_rope_runtime import build_adaptive_rope_freqs
 
 
 
@@ -568,6 +569,11 @@ def model_fn_wan_video(
         clip_embdding = dit.img_emb(clip_feature)
         context = torch.cat([clip_embdding, context], dim=1)
     
+    source_for_rope = kwargs.get("source_latents", None)
+    if source_for_rope is None:
+        source_for_rope = vace_context
+    if source_for_rope is None:
+        source_for_rope = x
     x, (f, h, w) = dit.patchify(x)
     
     # Reference image
@@ -576,11 +582,19 @@ def model_fn_wan_video(
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
     
-    freqs = torch.cat([
-        dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    sa_rope_adapter = getattr(dit, "sa_rope_adapter", None)
+
+    def make_freqs(block_id):
+        freqs = build_adaptive_rope_freqs(
+            dit,
+            f,
+            h,
+            w,
+            source_latents=source_for_rope,
+            pipe=kwargs.get("pipe", None),
+            block_id=block_id,
+        ).to(x.device)
+        return {"freqs": freqs, "adapter": sa_rope_adapter, "block_id": block_id, "grid_size": (f, h, w)}
     
     # TeaCache
     if tea_cache is not None:
@@ -589,6 +603,7 @@ def model_fn_wan_video(
         tea_cache_update = False
         
     if vace_context is not None:
+        freqs = make_freqs(-1)
         vace_hints = vace(x, vace_context, context, t_mod, freqs)
     
     # blocks
@@ -603,6 +618,7 @@ def model_fn_wan_video(
         x = tea_cache.update(x)
     else:
         for block_id, block in enumerate(dit.blocks):
+            freqs = make_freqs(block_id)
             x = block(x, context, t_mod, freqs)
             if vace_context is not None and block_id in vace.vace_layers_mapping:
                 current_vace_hint = vace_hints[vace.vace_layers_mapping[block_id]]
@@ -610,6 +626,8 @@ def model_fn_wan_video(
                     current_vace_hint = torch.chunk(current_vace_hint, get_sequence_parallel_world_size(), dim=1)[get_sequence_parallel_rank()]
                     current_vace_hint = torch.nn.functional.pad(current_vace_hint, (0, 0, 0, chunks[0].shape[1] - current_vace_hint.shape[1]), value=0)
                 x = x + current_vace_hint * vace_scale
+            if sa_rope_adapter is not None:
+                sa_rope_adapter.record_hidden(block_id, x, grid_size=(f, h, w))
         if tea_cache is not None:
             tea_cache.store(x)
             

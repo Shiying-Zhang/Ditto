@@ -1,5 +1,6 @@
 import math
 import torch, os, json
+from diffsynth.models.adaptive_rope_runtime import attach_adaptive_rope, load_adaptive_rope_checkpoint
 from diffsynth.models.latent_memory_runtime import attach_latent_memory, load_latent_memory_checkpoint
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
@@ -25,6 +26,12 @@ class WanTrainingModule(DiffusionTrainingModule):
         lora_base_model=None, lora_target_modules="q,k,v,o,ffn.0,ffn.2", lora_rank=32, lora_checkpoint=None,
         latent_memory_mode="none", latent_memory_tokens=4, latent_memory_hidden_dim=0,
         latent_memory_scale=1.0, latent_memory_init_std=0.02, latent_memory_checkpoint=None,
+        sa_rope_mode="none", sa_rope_hidden_dim=128, sa_rope_init_scale=0.1,
+        sa_rope_fixed_temporal_scale=1.0, sa_rope_fixed_spatial_scale=1.0,
+        sa_rope_min_scale=0.5, sa_rope_max_scale=1.5, sa_rope_reg_weight=0.0,
+        sa_rope_head_roles_path=None, sa_rope_default_head_role="alternate",
+        identity_distill_weight=0.0, first_frame_mmd_weight=0.0,
+        identity_distill_max_tokens=256,
         aux_loss_preset="none",
         latent_memory_code_diversity_weight=0.0,
         latent_memory_gate_entropy_weight=0.0,
@@ -81,6 +88,27 @@ class WanTrainingModule(DiffusionTrainingModule):
             required=latent_memory_checkpoint is not None,
             log_prefix="[WanTrainingModule] latent_memory",
         )
+        sa_rope_adapter = attach_adaptive_rope(
+            self.pipe,
+            mode=sa_rope_mode,
+            hidden_dim=sa_rope_hidden_dim,
+            init_scale=sa_rope_init_scale,
+            fixed_temporal_scale=sa_rope_fixed_temporal_scale,
+            fixed_spatial_scale=sa_rope_fixed_spatial_scale,
+            min_scale=sa_rope_min_scale,
+            max_scale=sa_rope_max_scale,
+            head_roles_path=sa_rope_head_roles_path,
+            default_head_role=sa_rope_default_head_role,
+            log_prefix="[WanTrainingModule] sa_rope",
+        )
+        load_adaptive_rope_checkpoint(
+            sa_rope_adapter,
+            lora_checkpoint,
+            required=False,
+            log_prefix="[WanTrainingModule] sa_rope",
+        )
+        if sa_rope_adapter is not None:
+            sa_rope_adapter.hidden_trace_max_tokens = int(identity_distill_max_tokens)
         
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -98,6 +126,10 @@ class WanTrainingModule(DiffusionTrainingModule):
             latent_feature_relation_weight=latent_feature_relation_weight,
             latent_feature_relation_margin=latent_feature_relation_margin,
             latent_feature_relation_max_tokens=latent_feature_relation_max_tokens,
+            sa_rope_reg_weight=sa_rope_reg_weight,
+            identity_distill_weight=identity_distill_weight,
+            first_frame_mmd_weight=first_frame_mmd_weight,
+            identity_distill_max_tokens=identity_distill_max_tokens,
         )
         if self._has_aux_loss():
             print(f"[WanTrainingModule] aux_loss_config={self.aux_loss_config}", flush=True)
@@ -126,8 +158,17 @@ class WanTrainingModule(DiffusionTrainingModule):
             "latent_memory_gate_usage_weight",
             "latent_feature_alignment_weight",
             "latent_feature_relation_weight",
+            "sa_rope_reg_weight",
+            "identity_distill_weight",
+            "first_frame_mmd_weight",
         )
         return any(float(self.aux_loss_config.get(key, 0.0) or 0.0) != 0.0 for key in keys)
+
+    def _sa_rope_regularization_loss(self):
+        adapter = getattr(self.pipe, "sa_rope_adapter", None)
+        if adapter is None:
+            return None
+        return adapter.regularization_loss()
 
     def _latent_memory_adapters(self):
         adapters = []
@@ -239,6 +280,79 @@ class WanTrainingModule(DiffusionTrainingModule):
         margin = float(self.aux_loss_config.get("latent_feature_relation_margin", 0.0) or 0.0)
         return torch.relu((pred_rel - target_rel).abs() - margin).mean()
 
+    def _trace_frame_tokens(self, trace_entry):
+        if "tokens" in trace_entry:
+            return trace_entry["tokens"].float()
+        hidden = trace_entry.get("hidden")
+        grid = trace_entry.get("grid_size")
+        if hidden is None or grid is None:
+            return None
+        f, h, w = [int(x) for x in grid]
+        spatial = h * w
+        token_count = min(hidden.shape[1], f * spatial)
+        if token_count < f:
+            return None
+        spatial = token_count // f
+        tokens = hidden[:, :f * spatial].reshape(hidden.shape[0], f, spatial, hidden.shape[-1])
+        max_tokens = int(self.aux_loss_config.get("identity_distill_max_tokens", 256) or 256)
+        sample_count = min(spatial, max_tokens)
+        if sample_count < spatial:
+            idx = torch.linspace(0, spatial - 1, sample_count, device=hidden.device).long()
+            tokens = tokens[:, :, idx]
+        return tokens.float()
+
+    def _identity_relation_distill_loss(self, outputs):
+        student = outputs.get("student_hidden_trace") or {}
+        teacher = outputs.get("identity_hidden_trace") or {}
+        losses = []
+        for block_id in sorted(set(student) & set(teacher)):
+            s_tokens = self._trace_frame_tokens(student[block_id])
+            t_tokens = self._trace_frame_tokens(teacher[block_id])
+            if s_tokens is None or t_tokens is None:
+                continue
+            s_frame = torch.nn.functional.normalize(s_tokens.mean(dim=2), dim=-1)
+            t_frame = torch.nn.functional.normalize(t_tokens.mean(dim=2), dim=-1)
+            s_rel = torch.matmul(s_frame, s_frame.transpose(-1, -2))
+            t_rel = torch.matmul(t_frame, t_frame.transpose(-1, -2))
+            losses.append(torch.nn.functional.mse_loss(s_rel, t_rel.detach()))
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
+    @staticmethod
+    def _mmd_rbf(x, y, gamma=None):
+        if x.numel() == 0 or y.numel() == 0:
+            return None
+        x = x.reshape(-1, x.shape[-1])
+        y = y.reshape(-1, y.shape[-1])
+        if gamma is None:
+            gamma = 1.0 / max(1, x.shape[-1])
+        xx = torch.cdist(x, x).pow(2)
+        yy = torch.cdist(y, y).pow(2)
+        xy = torch.cdist(x, y).pow(2)
+        return torch.exp(-gamma * xx).mean() + torch.exp(-gamma * yy).mean() - 2 * torch.exp(-gamma * xy).mean()
+
+    def _first_frame_mmd_loss(self, outputs):
+        student = outputs.get("student_hidden_trace") or {}
+        teacher = outputs.get("identity_hidden_trace") or {}
+        losses = []
+        for block_id in sorted(set(student) & set(teacher)):
+            s_tokens = self._trace_frame_tokens(student[block_id])
+            t_tokens = self._trace_frame_tokens(teacher[block_id])
+            if s_tokens is None or t_tokens is None or s_tokens.shape[1] < 2:
+                continue
+            s_tokens = torch.nn.functional.normalize(s_tokens, dim=-1)
+            t_tokens = torch.nn.functional.normalize(t_tokens, dim=-1)
+            for frame_id in range(1, s_tokens.shape[1]):
+                s_rel = torch.matmul(s_tokens[:, 0], s_tokens[:, frame_id].transpose(-1, -2))
+                t_rel = torch.matmul(t_tokens[:, 0], t_tokens[:, frame_id].transpose(-1, -2))
+                loss = self._mmd_rbf(s_rel, t_rel.detach())
+                if loss is not None:
+                    losses.append(loss)
+        if not losses:
+            return None
+        return torch.stack(losses).mean()
+
     def _auxiliary_loss(self, outputs):
         terms = []
         weighted_terms = []
@@ -274,6 +388,21 @@ class WanTrainingModule(DiffusionTrainingModule):
             "latent_relation",
             self._latent_feature_relation_loss(outputs["pred_x0"], outputs["target_x0"]),
             self.aux_loss_config.get("latent_feature_relation_weight"),
+        )
+        add_term(
+            "sa_rope_reg",
+            self._sa_rope_regularization_loss(),
+            self.aux_loss_config.get("sa_rope_reg_weight"),
+        )
+        add_term(
+            "identity_relation",
+            self._identity_relation_distill_loss(outputs),
+            self.aux_loss_config.get("identity_distill_weight"),
+        )
+        add_term(
+            "first_frame_mmd",
+            self._first_frame_mmd_loss(outputs),
+            self.aux_loss_config.get("first_frame_mmd_weight"),
         )
         if not weighted_terms:
             return outputs["loss"], ""
@@ -329,7 +458,16 @@ class WanTrainingModule(DiffusionTrainingModule):
         if not self._has_aux_loss():
             loss = self.pipe.training_loss(**models, **inputs)
             return loss
-        outputs = self.pipe.training_loss(**models, **inputs, return_outputs=True)
+        needs_identity = (
+            float(self.aux_loss_config.get("identity_distill_weight", 0.0) or 0.0) != 0.0
+            or float(self.aux_loss_config.get("first_frame_mmd_weight", 0.0) or 0.0) != 0.0
+        )
+        outputs = self.pipe.training_loss(
+            **models,
+            **inputs,
+            return_outputs=True,
+            identity_propagation=needs_identity,
+        )
         loss, aux_summary = self._auxiliary_loss(outputs)
         if aux_summary:
             self._last_aux_loss_summary = aux_summary
@@ -378,6 +516,19 @@ if __name__ == "__main__":
         latent_memory_scale=args.latent_memory_scale,
         latent_memory_init_std=args.latent_memory_init_std,
         latent_memory_checkpoint=args.latent_memory_checkpoint,
+        sa_rope_mode=args.sa_rope_mode,
+        sa_rope_hidden_dim=args.sa_rope_hidden_dim,
+        sa_rope_init_scale=args.sa_rope_init_scale,
+        sa_rope_fixed_temporal_scale=args.sa_rope_fixed_temporal_scale,
+        sa_rope_fixed_spatial_scale=args.sa_rope_fixed_spatial_scale,
+        sa_rope_min_scale=args.sa_rope_min_scale,
+        sa_rope_max_scale=args.sa_rope_max_scale,
+        sa_rope_reg_weight=args.sa_rope_reg_weight,
+        sa_rope_head_roles_path=args.sa_rope_head_roles_path,
+        sa_rope_default_head_role=args.sa_rope_default_head_role,
+        identity_distill_weight=args.identity_distill_weight,
+        first_frame_mmd_weight=args.first_frame_mmd_weight,
+        identity_distill_max_tokens=args.identity_distill_max_tokens,
         aux_loss_preset=args.aux_loss_preset,
         latent_memory_code_diversity_weight=args.latent_memory_code_diversity_weight,
         latent_memory_gate_entropy_weight=args.latent_memory_gate_entropy_weight,
@@ -393,6 +544,22 @@ if __name__ == "__main__":
         min_timestep_boundary=args.min_timestep_boundary,
     )
     print("[train.py] model ready", flush=True)
+    if args.sa_rope_trace_head_roles_output:
+        adapter = getattr(model.pipe, "sa_rope_adapter", None)
+        if adapter is None:
+            raise ValueError("--sa_rope_trace_head_roles_output requires --sa_rope_mode != none")
+        adapter.trace_head_roles = True
+        adapter.trace_max_spatial_tokens = int(args.sa_rope_trace_max_spatial_tokens)
+        adapter.reset_attention_role_votes()
+        sample_count = min(int(args.sa_rope_trace_head_roles_samples), len(dataset))
+        print(f"[train.py] tracing SA-RoPE head roles samples={sample_count}", flush=True)
+        model.eval()
+        with torch.no_grad():
+            for idx in range(sample_count):
+                model(dataset[idx])
+        adapter.save_head_roles_json(args.sa_rope_trace_head_roles_output)
+        print(f"[train.py] saved SA-RoPE head roles: {args.sa_rope_trace_head_roles_output}", flush=True)
+        raise SystemExit(0)
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt

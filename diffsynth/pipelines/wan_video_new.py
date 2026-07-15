@@ -22,6 +22,7 @@ from ..models.wan_video_image_encoder import WanImageEncoder
 from ..models.wan_video_vace import VaceWanModel
 from ..models.wan_video_motion_controller import WanMotionControllerModel
 from ..models.wan_video_animate_adapter import WanAnimateAdapter
+from ..models.adaptive_rope_runtime import build_adaptive_rope_freqs
 from ..schedulers.flow_match import FlowMatchScheduler
 from ..prompters import WanPrompter
 from ..vram_management import enable_vram_management, AutoWrappedModule, AutoWrappedLinear, WanAutoCastLayerNorm
@@ -106,6 +107,7 @@ class WanVideoPipeline(BasePipeline):
             loader.load(module, lora, alpha=alpha)
         
     def training_loss(self, return_outputs=False, **inputs):
+        identity_propagation = bool(inputs.pop("identity_propagation", False))
         max_timestep_boundary = int(inputs.get("max_timestep_boundary", 1) * self.scheduler.num_train_timesteps)
         min_timestep_boundary = int(inputs.get("min_timestep_boundary", 0) * self.scheduler.num_train_timesteps)
         timestep_id = torch.randint(min_timestep_boundary, max_timestep_boundary, (1,))
@@ -114,7 +116,12 @@ class WanVideoPipeline(BasePipeline):
         inputs["latents"] = self.scheduler.add_noise(inputs["input_latents"], inputs["noise"], timestep)
         training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
         
+        adapter = getattr(self, "sa_rope_adapter", None)
+        if adapter is not None and identity_propagation:
+            adapter.begin_hidden_trace("student")
         noise_pred = self.model_fn(**inputs, timestep=timestep)
+        if adapter is not None and identity_propagation:
+            adapter.end_hidden_trace()
         
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
         loss = loss * self.scheduler.training_weight(timestep)
@@ -124,7 +131,7 @@ class WanVideoPipeline(BasePipeline):
         while sigma.dim() < noise_pred.dim():
             sigma = sigma.view(*sigma.shape, *([1] * (noise_pred.dim() - sigma.dim())))
         pred_x0 = inputs["latents"] - sigma * noise_pred
-        return {
+        outputs = {
             "loss": loss,
             "noise_pred": noise_pred,
             "training_target": training_target,
@@ -132,6 +139,24 @@ class WanVideoPipeline(BasePipeline):
             "target_x0": inputs["input_latents"],
             "timestep": timestep,
         }
+        if identity_propagation and adapter is not None:
+            teacher_inputs = dict(inputs)
+            teacher_inputs["vace_context"] = self._identity_vace_context(inputs["input_latents"])
+            adapter.begin_hidden_trace("identity")
+            with torch.no_grad():
+                identity_noise_pred = self.model_fn(**teacher_inputs, timestep=timestep)
+            adapter.end_hidden_trace()
+            outputs["identity_noise_pred"] = identity_noise_pred
+            outputs["student_hidden_trace"] = adapter.pop_hidden_trace("student")
+            outputs["identity_hidden_trace"] = adapter.pop_hidden_trace("identity")
+        return outputs
+
+    def _identity_vace_context(self, target_latents):
+        inactive = torch.zeros_like(target_latents)
+        reactive = target_latents.detach()
+        b, _, f, h, w = target_latents.shape
+        mask = torch.ones((b, 64, f, h, w), dtype=target_latents.dtype, device=target_latents.device)
+        return torch.cat([inactive, reactive, mask], dim=1)
 
 
     def enable_vram_management(self, num_persistent_param_in_dit=None, vram_limit=None, vram_buffer=0.5):
@@ -1405,6 +1430,12 @@ def model_fn_wan_video(
         clip_embdding = dit.img_emb(clip_feature)
         context = torch.cat([clip_embdding, context], dim=1)
     
+    source_for_rope = kwargs.get("source_latents", None)
+    if source_for_rope is None:
+        source_for_rope = vace_context
+    if source_for_rope is None:
+        source_for_rope = x
+
     # Camera control
     x = dit.patchify(x, control_camera_latents_input)
     
@@ -1424,11 +1455,18 @@ def model_fn_wan_video(
         x = torch.concat([reference_latents, x], dim=1)
         f += 1
     
-    freqs = torch.cat([
-        dit.freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
-        dit.freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
-        dit.freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
-    ], dim=-1).reshape(f * h * w, 1, -1).to(x.device)
+    sa_rope_adapter = getattr(dit, "sa_rope_adapter", None)
+
+    def make_freqs(block_id):
+        freqs = build_adaptive_rope_freqs(
+            dit,
+            f,
+            h,
+            w,
+            source_latents=source_for_rope,
+            block_id=block_id,
+        ).to(x.device)
+        return {"freqs": freqs, "adapter": sa_rope_adapter, "block_id": block_id, "grid_size": (f, h, w)}
     
     # TeaCache
     if tea_cache is not None:
@@ -1437,6 +1475,7 @@ def model_fn_wan_video(
         tea_cache_update = False
         
     if vace_context is not None:
+        freqs = make_freqs(-1)
         vace_hints = vace(
             x, vace_context, context, t_mod, freqs,
             use_gradient_checkpointing=use_gradient_checkpointing,
@@ -1459,6 +1498,7 @@ def model_fn_wan_video(
             return custom_forward
         
         for block_id, block in enumerate(dit.blocks):
+            freqs = make_freqs(block_id)
             # Block
             if use_gradient_checkpointing_offload:
                 with torch.autograd.graph.save_on_cpu():
@@ -1491,6 +1531,8 @@ def model_fn_wan_video(
             # Animate
             if pose_latents is not None and face_pixel_values is not None:
                 x = animate_adapter.after_transformer_block(block_id, x, motion_vec)
+            if sa_rope_adapter is not None:
+                sa_rope_adapter.record_hidden(block_id, x, grid_size=(f, h, w))
         if tea_cache is not None:
             tea_cache.store(x)
             
