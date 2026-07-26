@@ -350,7 +350,7 @@ def build_adaptive_rope_freqs(model, f, h, w, source_latents=None, pipe=None, bl
     temporal_freqs = _axis_freq_grid(model, f, h, w, scale_f=temporal_scale, scale_h=None, scale_w=None)
     spatial_freqs = spatial_freqs.expand(-1, num_heads, -1)
     temporal_freqs = temporal_freqs.expand(-1, num_heads, -1)
-    role_mask = roles.view(1, num_heads, 1) == TEMPORAL_HEAD
+    role_mask = (roles.view(1, num_heads, 1) == TEMPORAL_HEAD).to(device=temporal_freqs.device)
     return torch.where(role_mask, temporal_freqs, spatial_freqs)
 
 
