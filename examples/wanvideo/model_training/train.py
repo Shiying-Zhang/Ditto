@@ -1,6 +1,7 @@
 import math
 import torch, os, json
 from diffsynth.models.adaptive_rope_runtime import attach_adaptive_rope, load_adaptive_rope_checkpoint
+from diffsynth.models.easyvfx_frequency_runtime import build_easyvfx_frequency_loss
 from diffsynth.models.latent_memory_runtime import attach_latent_memory, load_latent_memory_checkpoint
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
@@ -41,6 +42,15 @@ class WanTrainingModule(DiffusionTrainingModule):
         latent_feature_relation_weight=0.0,
         latent_feature_relation_margin=0.0,
         latent_feature_relation_max_tokens=256,
+        easyvfx_frequency_mode="none",
+        easyvfx_low_ratio=0.25,
+        easyvfx_temporal_low_ratio=0.35,
+        easyvfx_low_weight=0.0,
+        easyvfx_high_weight=0.0,
+        easyvfx_temporal_weight=0.0,
+        easyvfx_descriptor_weight=0.0,
+        easyvfx_adaptive_weight=0.0,
+        easyvfx_adaptive_temperature=0.7,
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
@@ -133,6 +143,27 @@ class WanTrainingModule(DiffusionTrainingModule):
         )
         if self._has_aux_loss():
             print(f"[WanTrainingModule] aux_loss_config={self.aux_loss_config}", flush=True)
+        self.easyvfx_frequency_loss = build_easyvfx_frequency_loss(
+            mode=easyvfx_frequency_mode,
+            low_ratio=easyvfx_low_ratio,
+            temporal_low_ratio=easyvfx_temporal_low_ratio,
+            low_weight=easyvfx_low_weight,
+            high_weight=easyvfx_high_weight,
+            temporal_weight=easyvfx_temporal_weight,
+            descriptor_weight=easyvfx_descriptor_weight,
+            adaptive_weight=easyvfx_adaptive_weight,
+            adaptive_temperature=easyvfx_adaptive_temperature,
+        )
+        if self.easyvfx_frequency_loss is not None:
+            print(
+                "[WanTrainingModule] easyvfx_frequency="
+                f"mode={easyvfx_frequency_mode}, low_ratio={easyvfx_low_ratio}, "
+                f"temporal_low_ratio={easyvfx_temporal_low_ratio}, "
+                f"weights=(low={easyvfx_low_weight}, high={easyvfx_high_weight}, "
+                f"temporal={easyvfx_temporal_weight}, descriptor={easyvfx_descriptor_weight}, "
+                f"adaptive={easyvfx_adaptive_weight})",
+                flush=True,
+            )
         
     @staticmethod
     def _build_aux_loss_config(**kwargs):
@@ -162,7 +193,9 @@ class WanTrainingModule(DiffusionTrainingModule):
             "identity_distill_weight",
             "first_frame_mmd_weight",
         )
-        return any(float(self.aux_loss_config.get(key, 0.0) or 0.0) != 0.0 for key in keys)
+        if any(float(self.aux_loss_config.get(key, 0.0) or 0.0) != 0.0 for key in keys):
+            return True
+        return getattr(self, "easyvfx_frequency_loss", None) is not None
 
     def _sa_rope_regularization_loss(self):
         adapter = getattr(self.pipe, "sa_rope_adapter", None)
@@ -404,10 +437,20 @@ class WanTrainingModule(DiffusionTrainingModule):
             self._first_frame_mmd_loss(outputs),
             self.aux_loss_config.get("first_frame_mmd_weight"),
         )
+        easyvfx_loss, easyvfx_metrics = self._easyvfx_frequency_aux_loss(outputs)
+        add_term("easyvfx_freq", easyvfx_loss, 1.0)
+        for metric_name, metric_value in easyvfx_metrics.items():
+            terms.append(f"easyvfx_{metric_name}={float(metric_value.detach().item()):.6f}")
         if not weighted_terms:
             return outputs["loss"], ""
         aux_loss = torch.stack(weighted_terms).sum()
         return outputs["loss"] + aux_loss, "; ".join(terms)
+
+    def _easyvfx_frequency_aux_loss(self, outputs):
+        module = getattr(self, "easyvfx_frequency_loss", None)
+        if module is None:
+            return None, {}
+        return module(outputs["pred_x0"], outputs["target_x0"])
         
     def forward_preprocess(self, data):
         # CFG-sensitive parameters
@@ -538,6 +581,15 @@ if __name__ == "__main__":
         latent_feature_relation_weight=args.latent_feature_relation_weight,
         latent_feature_relation_margin=args.latent_feature_relation_margin,
         latent_feature_relation_max_tokens=args.latent_feature_relation_max_tokens,
+        easyvfx_frequency_mode=args.easyvfx_frequency_mode,
+        easyvfx_low_ratio=args.easyvfx_low_ratio,
+        easyvfx_temporal_low_ratio=args.easyvfx_temporal_low_ratio,
+        easyvfx_low_weight=args.easyvfx_low_weight,
+        easyvfx_high_weight=args.easyvfx_high_weight,
+        easyvfx_temporal_weight=args.easyvfx_temporal_weight,
+        easyvfx_descriptor_weight=args.easyvfx_descriptor_weight,
+        easyvfx_adaptive_weight=args.easyvfx_adaptive_weight,
+        easyvfx_adaptive_temperature=args.easyvfx_adaptive_temperature,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         extra_inputs=args.extra_inputs,
         max_timestep_boundary=args.max_timestep_boundary,
