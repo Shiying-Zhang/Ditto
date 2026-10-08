@@ -62,6 +62,11 @@ def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads
     return x
 
 
+def add_projection_delta(base: torch.Tensor, delta: torch.Tensor):
+    """Keep adapter residuals in the projection's autocast dtype."""
+    return base + delta.to(device=base.device, dtype=base.dtype)
+
+
 def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
     return (x * (1 + scale) + shift)
 
@@ -145,9 +150,40 @@ class SelfAttention(nn.Module):
         rope_meta = freqs if isinstance(freqs, dict) else None
         if rope_meta is not None:
             freqs = rope_meta["freqs"]
-        q = self.norm_q(self.q(x))
-        k = self.norm_k(self.k(x))
-        v = self.v(x)
+        video_frequency_adapter = None if rope_meta is None else rope_meta.get("video_frequency_adapter")
+        routing_weights = None if rope_meta is None else rope_meta.get("video_frequency_routing")
+        block_id = 0 if rope_meta is None else rope_meta.get("block_id", 0)
+        key_value_states = x
+        key_value_routing = routing_weights
+        if video_frequency_adapter is not None:
+            key_value_states, key_value_routing = video_frequency_adapter.attention_context(
+                block_id,
+                x,
+                routing_weights,
+                rope_meta.get("video_frequency_attention_mode", "idle"),
+            )
+        if video_frequency_adapter is None:
+            q = self.q(x)
+            k = self.k(key_value_states)
+            v = self.v(key_value_states)
+        else:
+            q_base = self.q(x)
+            k_base = self.k(key_value_states)
+            v_base = self.v(key_value_states)
+            q = add_projection_delta(
+                q_base,
+                video_frequency_adapter.projection_delta(block_id, "q", x, routing_weights),
+            )
+            k = add_projection_delta(
+                k_base,
+                video_frequency_adapter.projection_delta(block_id, "k", key_value_states, key_value_routing),
+            )
+            v = add_projection_delta(
+                v_base,
+                video_frequency_adapter.projection_delta(block_id, "v", key_value_states, key_value_routing),
+            )
+        q = self.norm_q(q)
+        k = self.norm_k(k)
         q = rope_apply(q, freqs, self.num_heads, flatten=False)
         k = rope_apply(k, freqs, self.num_heads, flatten=False)
         if rope_meta is not None and rope_meta.get("adapter", None) is not None:
@@ -160,7 +196,13 @@ class SelfAttention(nn.Module):
         q = rearrange(q, "b s n d -> b s (n d)")
         k = rearrange(k, "b s n d -> b s (n d)")
         x = self.attn(q, k, v)
-        return self.o(x)
+        output = self.o(x)
+        if video_frequency_adapter is not None:
+            output = add_projection_delta(
+                output,
+                video_frequency_adapter.projection_delta(block_id, "o", x, routing_weights),
+            )
+        return output
 
 
 class CrossAttention(nn.Module):
@@ -354,8 +396,16 @@ class WanModel(torch.nn.Module):
             self.control_adapter = None
 
     def patchify(self, x: torch.Tensor, control_camera_latents_input: Optional[torch.Tensor] = None):
+        video_frequency_adapter = getattr(self, "video_frequency_adapter", None)
+        if video_frequency_adapter is not None:
+            x = video_frequency_adapter.pre_patch_antialias(x, self.patch_size)
         x = self.patch_embedding(x)
         if self.control_adapter is not None and control_camera_latents_input is not None:
+            if video_frequency_adapter is not None:
+                control_camera_latents_input = video_frequency_adapter.pre_patch_antialias(
+                    control_camera_latents_input,
+                    self.patch_size,
+                )
             y_camera = self.control_adapter(control_camera_latents_input)
             x = [u + v for u, v in zip(x, y_camera)]
             x = x[0].unsqueeze(0)

@@ -48,14 +48,31 @@ class VaceWanModel(torch.nn.Module):
         ])
 
         # vace patch embeddings
-        self.vace_patch_embedding = torch.nn.Conv3d(vace_in_dim, dim, kernel_size=patch_size, stride=patch_size)
+        self.vace_patch_stride = tuple(patch_size)
+        self.vace_patch_embedding = torch.nn.Conv3d(
+            vace_in_dim,
+            dim,
+            kernel_size=self.vace_patch_stride,
+            stride=self.vace_patch_stride,
+        )
 
     def forward(
         self, x, vace_context, context, t_mod, freqs,
         use_gradient_checkpointing: bool = False,
         use_gradient_checkpointing_offload: bool = False,
     ):
-        c = [self.vace_patch_embedding(u.unsqueeze(0)) for u in vace_context]
+        video_frequency_adapter = freqs.get("video_frequency_adapter") if isinstance(freqs, dict) else None
+
+        def patch_context(item):
+            item = item.unsqueeze(0)
+            if video_frequency_adapter is not None:
+                item = video_frequency_adapter.pre_patch_antialias(
+                    item,
+                    self.vace_patch_stride,
+                )
+            return self.vace_patch_embedding(item)
+
+        c = [patch_context(u) for u in vace_context]
         c = [u.flatten(2).transpose(1, 2) for u in c]
         c = torch.cat([
             torch.cat([u, u.new_zeros(1, x.shape[1] - u.size(1), u.size(2))],

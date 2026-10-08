@@ -13,6 +13,11 @@ if str(REPO_ROOT) not in sys.path:
 
 from diffsynth import save_video, VideoData
 from diffsynth.models.latent_memory_runtime import attach_latent_memory, load_latent_memory_checkpoint
+from diffsynth.models.video_frequency_equivariance import (
+    attach_video_frequency_equivariance,
+    infer_video_frequency_config,
+    load_video_frequency_checkpoint,
+)
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 
 
@@ -126,19 +131,52 @@ def main(args):
             required=True,
             log_prefix="[infer_ditto] latent_memory",
         )
+    video_frequency_checkpoint = args.video_frequency_checkpoint
+    video_frequency_config = None
+    if args.video_frequency_mode == "auto":
+        for candidate in ([video_frequency_checkpoint] if video_frequency_checkpoint else []) + lora_paths:
+            video_frequency_config = infer_video_frequency_config(candidate)
+            if video_frequency_config is not None:
+                video_frequency_checkpoint = candidate
+                break
+    elif args.video_frequency_mode != "none":
+        video_frequency_config = {
+            "mode": args.video_frequency_mode,
+            "blocks": args.video_frequency_blocks,
+            "rank": args.video_frequency_rank,
+            "num_experts": args.video_frequency_num_experts,
+            "router_hidden_dim": args.video_frequency_router_hidden_dim,
+        }
+        if not video_frequency_checkpoint and lora_paths:
+            video_frequency_checkpoint = lora_paths[0]
+    if video_frequency_config is not None:
+        video_frequency_adapter = attach_video_frequency_equivariance(
+            pipe,
+            **video_frequency_config,
+            router_temperature=args.video_frequency_router_temperature,
+            equivariance_weight=0.0,
+            log_prefix="[infer_ditto] video_frequency",
+        )
+        if video_frequency_adapter.uses_frequency_experts:
+            if not video_frequency_checkpoint:
+                raise RuntimeError("frequency-expert inference requires a checkpoint containing adapter weights")
+            load_video_frequency_checkpoint(
+                video_frequency_adapter,
+                video_frequency_checkpoint,
+                required=True,
+                log_prefix="[infer_ditto] video_frequency",
+            )
     for lora_path, alpha in zip(lora_paths, lora_alphas):
         print(f"Loading Ditto LoRA model: {lora_path} (alpha={alpha})")
         if not os.path.exists(lora_path):
-            print(f"Error: LoRA file not found at {lora_path}")
-            return
+            raise FileNotFoundError(f"LoRA file not found at {lora_path}")
         pipe.load_lora(pipe.vace, lora_path, alpha=alpha)
 
     pipe.enable_vram_management()
 
     print(f"Loading input video: {args.input_video}")
     if not os.path.exists(args.input_video):
-        print(f"Error: Input video file not found at {args.input_video}")
-        return
+        raise FileNotFoundError(f"Input video file not found at {args.input_video}")
         
     input_video_path = args.control_video or args.input_video
     video = VideoData(input_video_path, height=args.height, width=args.width)
@@ -147,7 +185,15 @@ def main(args):
     if num_frames != args.num_frames:
         print(f"Warning: Requested number of frames ({args.num_frames}) exceeds total video frames ({len(video)}). Using {num_frames} frames instead.")
         
-    video = [video[i] for i in range(num_frames)]
+    if num_frames == len(video):
+        video = [video[i] for i in range(num_frames)]
+    elif num_frames == 1:
+        video = [video[0]]
+    else:
+        video = [
+            video[round(i * (len(video) - 1) / (num_frames - 1))]
+            for i in range(num_frames)
+        ]
     
     reference_image = None
     if args.reference_image:
@@ -186,6 +232,8 @@ def main(args):
         "latent_memory_scale": args.latent_memory_scale,
         "latent_memory_init_std": args.latent_memory_init_std,
         "latent_memory_checkpoint": latent_memory_checkpoint,
+        "video_frequency_config": video_frequency_config,
+        "video_frequency_checkpoint": video_frequency_checkpoint or "",
         "resolution": [args.width, args.height],
         "num_frames": num_frames,
         "fps": args.fps,
@@ -223,7 +271,23 @@ if __name__ == "__main__":
     parser.add_argument("--latent_memory_scale", type=float, default=1.0, help="Scale applied to latent memory output.")
     parser.add_argument("--latent_memory_init_std", type=float, default=0.02, help="Initialization std for latent memory parameters.")
     parser.add_argument("--latent_memory_checkpoint", type=str, default="", help="Checkpoint containing latent memory weights. Defaults to the first LoRA checkpoint when latent_memory_mode is enabled.")
-    parser.add_argument("--fps", type=int, default=20, help="Frames per second (FPS) for the output video.")
+    parser.add_argument(
+        "--video_frequency_mode",
+        choices=[
+            "auto", "none", "easyvfx_faithful", "afldm_spatial_faithful",
+            "video_temporal_extension", "easyvfx", "fei", "fera", "afldm",
+            "fei_ea", "fera_ea", "equivariant",
+        ],
+        default="auto",
+        help="Auto-detect or explicitly select a separated frequency/equivariance configuration.",
+    )
+    parser.add_argument("--video_frequency_checkpoint", type=str, default="", help="Checkpoint containing video frequency adapter weights. Defaults to auto-detecting a LoRA checkpoint.")
+    parser.add_argument("--video_frequency_blocks", default="all")
+    parser.add_argument("--video_frequency_rank", type=int, default=4)
+    parser.add_argument("--video_frequency_num_experts", type=int, default=3)
+    parser.add_argument("--video_frequency_router_hidden_dim", type=int, default=64)
+    parser.add_argument("--video_frequency_router_temperature", type=float, default=0.7)
+    parser.add_argument("--fps", type=float, default=20.0, help="Frames per second (FPS) for the output video.")
     parser.add_argument("--quality", type=int, default=5, help="Quality of the output video (CRF value, lower is better).")
 
     args = parser.parse_args()

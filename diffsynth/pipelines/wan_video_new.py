@@ -117,14 +117,48 @@ class WanVideoPipeline(BasePipeline):
         training_target = self.scheduler.training_target(inputs["input_latents"], inputs["noise"], timestep)
         
         adapter = getattr(self, "sa_rope_adapter", None)
+        frequency_adapter = getattr(self.dit, "video_frequency_adapter", None)
+        run_equivariance = False
+        attention_mode = "idle"
+        if frequency_adapter is not None and frequency_adapter.uses_equivariance_loss:
+            probability = frequency_adapter.equivariance_probability
+            run_equivariance = probability >= 1.0 or bool(
+                (torch.rand((), device=inputs["latents"].device) < probability).item()
+            )
+            if run_equivariance:
+                frequency_adapter.clear_attention_cache()
+                attention_mode = "store"
         if adapter is not None and identity_propagation:
             adapter.begin_hidden_trace("student")
-        noise_pred = self.model_fn(**inputs, timestep=timestep)
+        noise_pred = self.model_fn(
+            **inputs,
+            timestep=timestep,
+            video_frequency_attention_mode=attention_mode,
+        )
         if adapter is not None and identity_propagation:
             adapter.end_hidden_trace()
         
         loss = torch.nn.functional.mse_loss(noise_pred.float(), training_target.float())
         loss = loss * self.scheduler.training_weight(timestep)
+        equivariance_loss = None
+        if run_equivariance:
+            shift = frequency_adapter.sample_shift(inputs["latents"].device)
+            shifted_inputs = frequency_adapter.shift_model_inputs(inputs, shift)
+            shifted_prediction = self.model_fn(
+                **shifted_inputs,
+                timestep=timestep,
+                video_frequency_attention_mode="load",
+            )
+            equivariance_loss = frequency_adapter.equivariance_loss(
+                shifted_prediction,
+                noise_pred,
+                shift,
+            )
+            loss = loss + (
+                frequency_adapter.equivariance_weight
+                * equivariance_loss
+                * self.scheduler.training_weight(timestep)
+            )
         if not return_outputs:
             return loss
         sigma = self.scheduler.sigmas[timestep_id].to(dtype=noise_pred.dtype, device=noise_pred.device)
@@ -138,6 +172,7 @@ class WanVideoPipeline(BasePipeline):
             "pred_x0": pred_x0,
             "target_x0": inputs["input_latents"],
             "timestep": timestep,
+            "video_frequency_equivariance_loss": equivariance_loss,
         }
         if identity_propagation and adapter is not None:
             teacher_inputs = dict(inputs)
@@ -1423,6 +1458,18 @@ def model_fn_wan_video(
     if timestep.shape[0] != context.shape[0]:
         timestep = torch.concat([timestep] * context.shape[0], dim=0)
 
+    video_frequency_adapter = getattr(dit, "video_frequency_adapter", None)
+    video_frequency_routing = None
+    if video_frequency_adapter is not None:
+        video_frequency_routing = video_frequency_adapter.route(latents)
+        if video_frequency_routing is not None and video_frequency_routing.shape[0] != x.shape[0]:
+            if x.shape[0] % video_frequency_routing.shape[0] != 0:
+                raise RuntimeError("video frequency routing batch does not match Wan hidden-state batch")
+            video_frequency_routing = torch.cat(
+                [video_frequency_routing] * (x.shape[0] // video_frequency_routing.shape[0]),
+                dim=0,
+            )
+
     # Image Embedding
     if y is not None and dit.require_vae_embedding:
         x = torch.cat([x, y], dim=1)
@@ -1456,6 +1503,7 @@ def model_fn_wan_video(
         f += 1
     
     sa_rope_adapter = getattr(dit, "sa_rope_adapter", None)
+    video_frequency_attention_mode = kwargs.get("video_frequency_attention_mode", "idle")
 
     def make_freqs(block_id):
         freqs = build_adaptive_rope_freqs(
@@ -1466,7 +1514,15 @@ def model_fn_wan_video(
             source_latents=source_for_rope,
             block_id=block_id,
         ).to(x.device)
-        return {"freqs": freqs, "adapter": sa_rope_adapter, "block_id": block_id, "grid_size": (f, h, w)}
+        return {
+            "freqs": freqs,
+            "adapter": sa_rope_adapter,
+            "block_id": block_id,
+            "grid_size": (f, h, w),
+            "video_frequency_adapter": video_frequency_adapter,
+            "video_frequency_routing": video_frequency_routing,
+            "video_frequency_attention_mode": video_frequency_attention_mode,
+        }
     
     # TeaCache
     if tea_cache is not None:

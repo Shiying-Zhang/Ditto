@@ -3,6 +3,10 @@ import torch, os, json
 from diffsynth.models.adaptive_rope_runtime import attach_adaptive_rope, load_adaptive_rope_checkpoint
 from diffsynth.models.easyvfx_frequency_runtime import build_easyvfx_frequency_loss
 from diffsynth.models.latent_memory_runtime import attach_latent_memory, load_latent_memory_checkpoint
+from diffsynth.models.video_frequency_equivariance import (
+    attach_video_frequency_equivariance,
+    load_video_frequency_checkpoint,
+)
 from diffsynth.pipelines.wan_video_new import WanVideoPipeline, ModelConfig
 from diffsynth.trainers.utils import DiffusionTrainingModule, ModelLogger, launch_training_task, wan_parser
 from diffsynth.trainers.unified_dataset import UnifiedDataset, LoadVideo, ImageCropAndResize, ToAbsolutePath
@@ -51,6 +55,21 @@ class WanTrainingModule(DiffusionTrainingModule):
         easyvfx_descriptor_weight=0.0,
         easyvfx_adaptive_weight=0.0,
         easyvfx_adaptive_temperature=0.7,
+        video_frequency_mode="none",
+        video_frequency_blocks="all",
+        video_frequency_rank=4,
+        video_frequency_num_experts=3,
+        video_frequency_router_hidden_dim=64,
+        video_frequency_router_temperature=0.7,
+        video_frequency_equivariance_weight=0.0,
+        video_frequency_equivariance_probability=1.0,
+        video_frequency_temporal_shift=0.5,
+        video_frequency_spatial_shift=0.5,
+        video_frequency_temporal_cutoff=0.8,
+        video_frequency_spatial_cutoff=0.9,
+        video_frequency_cutoff_transition=0.1,
+        video_frequency_spatial_shift_quantum=0.125,
+        video_frequency_reference_grad=False,
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
@@ -119,6 +138,32 @@ class WanTrainingModule(DiffusionTrainingModule):
         )
         if sa_rope_adapter is not None:
             sa_rope_adapter.hidden_trace_max_tokens = int(identity_distill_max_tokens)
+        video_frequency_adapter = attach_video_frequency_equivariance(
+            self.pipe,
+            mode=video_frequency_mode,
+            blocks=video_frequency_blocks,
+            rank=video_frequency_rank,
+            num_experts=video_frequency_num_experts,
+            router_hidden_dim=video_frequency_router_hidden_dim,
+            router_temperature=video_frequency_router_temperature,
+            equivariance_weight=video_frequency_equivariance_weight,
+            equivariance_probability=video_frequency_equivariance_probability,
+            temporal_shift=video_frequency_temporal_shift,
+            spatial_shift=video_frequency_spatial_shift,
+            temporal_cutoff=video_frequency_temporal_cutoff,
+            spatial_cutoff=video_frequency_spatial_cutoff,
+            cutoff_transition=video_frequency_cutoff_transition,
+            spatial_shift_quantum=video_frequency_spatial_shift_quantum,
+            detach_reference=not video_frequency_reference_grad,
+            detach_equivariance_target=False,
+            log_prefix="[WanTrainingModule] video_frequency",
+        )
+        load_video_frequency_checkpoint(
+            video_frequency_adapter,
+            lora_checkpoint,
+            required=False,
+            log_prefix="[WanTrainingModule] video_frequency",
+        )
         
         # Store other configs
         self.use_gradient_checkpointing = use_gradient_checkpointing
@@ -194,6 +239,8 @@ class WanTrainingModule(DiffusionTrainingModule):
             "first_frame_mmd_weight",
         )
         if any(float(self.aux_loss_config.get(key, 0.0) or 0.0) != 0.0 for key in keys):
+            return True
+        if getattr(self.pipe.dit, "video_frequency_adapter", None) is not None:
             return True
         return getattr(self, "easyvfx_frequency_loss", None) is not None
 
@@ -441,8 +488,11 @@ class WanTrainingModule(DiffusionTrainingModule):
         add_term("easyvfx_freq", easyvfx_loss, 1.0)
         for metric_name, metric_value in easyvfx_metrics.items():
             terms.append(f"easyvfx_{metric_name}={float(metric_value.detach().item()):.6f}")
+        equivariance_loss = outputs.get("video_frequency_equivariance_loss")
+        if equivariance_loss is not None:
+            terms.append(f"video_frequency_equiv={float(equivariance_loss.detach().item()):.6f}")
         if not weighted_terms:
-            return outputs["loss"], ""
+            return outputs["loss"], "; ".join(terms)
         aux_loss = torch.stack(weighted_terms).sum()
         return outputs["loss"] + aux_loss, "; ".join(terms)
 
@@ -590,6 +640,21 @@ if __name__ == "__main__":
         easyvfx_descriptor_weight=args.easyvfx_descriptor_weight,
         easyvfx_adaptive_weight=args.easyvfx_adaptive_weight,
         easyvfx_adaptive_temperature=args.easyvfx_adaptive_temperature,
+        video_frequency_mode=args.video_frequency_mode,
+        video_frequency_blocks=args.video_frequency_blocks,
+        video_frequency_rank=args.video_frequency_rank,
+        video_frequency_num_experts=args.video_frequency_num_experts,
+        video_frequency_router_hidden_dim=args.video_frequency_router_hidden_dim,
+        video_frequency_router_temperature=args.video_frequency_router_temperature,
+        video_frequency_equivariance_weight=args.video_frequency_equivariance_weight,
+        video_frequency_equivariance_probability=args.video_frequency_equivariance_probability,
+        video_frequency_temporal_shift=args.video_frequency_temporal_shift,
+        video_frequency_spatial_shift=args.video_frequency_spatial_shift,
+        video_frequency_temporal_cutoff=args.video_frequency_temporal_cutoff,
+        video_frequency_spatial_cutoff=args.video_frequency_spatial_cutoff,
+        video_frequency_cutoff_transition=args.video_frequency_cutoff_transition,
+        video_frequency_spatial_shift_quantum=args.video_frequency_spatial_shift_quantum,
+        video_frequency_reference_grad=args.video_frequency_reference_grad,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         extra_inputs=args.extra_inputs,
         max_timestep_boundary=args.max_timestep_boundary,

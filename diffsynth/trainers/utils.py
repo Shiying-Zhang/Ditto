@@ -708,6 +708,31 @@ def wan_parser():
     parser.add_argument("--easyvfx_descriptor_weight", type=float, default=0.0, help="Weight for normalized frequency-energy descriptor matching.")
     parser.add_argument("--easyvfx_adaptive_weight", type=float, default=0.0, help="Weight for sample-adaptive frequency routing loss.")
     parser.add_argument("--easyvfx_adaptive_temperature", type=float, default=0.7, help="Temperature for target-frequency-energy routing.")
+    parser.add_argument(
+        "--video_frequency_mode",
+        type=str,
+        default="none",
+        choices=[
+            "none", "easyvfx_faithful", "afldm_spatial_faithful",
+            "video_temporal_extension", "easyvfx", "fei", "fera", "afldm",
+            "fei_ea", "fera_ea", "equivariant",
+        ],
+        help="Separated EasyVFX, spatial AF-LDM, or proposed temporal-video configuration.",
+    )
+    parser.add_argument("--video_frequency_blocks", type=str, default="all", help="Wan block IDs receiving frequency experts and/or reference hidden-state EA; faithful configurations default to all blocks.")
+    parser.add_argument("--video_frequency_rank", type=int, default=4, help="Total q/k/v/o LoRA rank split across frequency experts in each selected block; EasyVFX uses total rank 4.")
+    parser.add_argument("--video_frequency_num_experts", type=int, default=3, help="Number of low/mid/high frequency experts.")
+    parser.add_argument("--video_frequency_router_hidden_dim", type=int, default=64, help="Hidden width of the six-dimensional FEI router.")
+    parser.add_argument("--video_frequency_router_temperature", type=float, default=0.7, help="Softmax temperature of the FEI router.")
+    parser.add_argument("--video_frequency_equivariance_weight", type=float, default=0.0, help="Weight of the band-limited spatiotemporal score-equivariance loss.")
+    parser.add_argument("--video_frequency_equivariance_probability", type=float, default=1.0, help="Probability of executing the paired equivariance forward on a training batch.")
+    parser.add_argument("--video_frequency_temporal_shift", type=float, default=0.5, help="Maximum fractional temporal shift in latent frames.")
+    parser.add_argument("--video_frequency_spatial_shift", type=float, default=0.5, help="Maximum fractional spatial shift in latent cells.")
+    parser.add_argument("--video_frequency_temporal_cutoff", type=float, default=0.8, help="Temporal anti-alias cutoff as a fraction of Nyquist.")
+    parser.add_argument("--video_frequency_spatial_cutoff", type=float, default=0.9, help="Spatial anti-alias cutoff as a fraction of corner frequency.")
+    parser.add_argument("--video_frequency_cutoff_transition", type=float, default=0.1, help="Raised-cosine transition width for anti-alias filtering.")
+    parser.add_argument("--video_frequency_spatial_shift_quantum", type=float, default=0.125, help="Spatial shift grid in latent cells for AF-LDM-style ideal interpolation.")
+    parser.add_argument("--video_frequency_reference_grad", default=False, action="store_true", help="Keep gradients through the Equivariant Attention reference hidden states. The faithful spatial loss target keeps gradients independently.")
     parser.add_argument("--extra_inputs", default=None, help="Additional model inputs, comma-separated.")
     parser.add_argument("--use_gradient_checkpointing_offload", default=False, action="store_true", help="Whether to offload gradient checkpointing to CPU memory.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1, help="Gradient accumulation steps.")
